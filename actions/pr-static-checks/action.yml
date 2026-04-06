@@ -1,0 +1,247 @@
+name: "unifox-ci: PR Static Checks"
+description: >
+  Runs static checks on a PR: branch naming convention, version bump,
+  manifest & structure, test existence, and flake8 lint.
+  Posts a summary comment and fails the job if any check fails.
+
+inputs:
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  profile:
+    description: "Repository profile (odoo, default)"
+    required: false
+    default: "default"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install lint tools
+      shell: bash
+      run: pip install flake8
+
+    - name: Detect modified modules
+      id: detect
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        if [ -z "$MODS" ]; then
+          echo "No Odoo modules modified — skipping module-level checks."
+        else
+          echo "Modified modules: $MODS"
+        fi
+
+    - name: "[1] Branch naming"
+      id: branch
+      continue-on-error: true
+      shell: bash
+      run: |
+        BRANCH="${{ github.head_ref }}"
+        if [[ "$BRANCH" =~ ^release[/-] ]]; then
+          echo "PASS: '$BRANCH' matches required pattern"
+        else
+          echo "FAIL: '$BRANCH' does not match naming convention."
+          echo "      Branches must start with 'release/' or 'release-'."
+          exit 1
+        fi
+
+    - name: "[2] Version bump"
+      id: version
+      continue-on-error: true
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        python "${{ github.action_path }}/../../scripts/check_version_bump.py" \
+          "$BASE_BRANCH" ${{ steps.detect.outputs.modules }}
+
+    - name: "[3] Manifest & structure"
+      id: manifest
+      continue-on-error: true
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        python "${{ github.action_path }}/../../scripts/check_manifest.py" \
+          ${{ steps.detect.outputs.modules }}
+
+    - name: "[4] Tests exist"
+      id: tests
+      continue-on-error: true
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        python "${{ github.action_path }}/../../scripts/check_tests.py" \
+          ${{ steps.detect.outputs.modules }}
+
+    - name: "[5] Lint (flake8)"
+      id: lint
+      continue-on-error: true
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        FILES=$(git diff --name-only "origin/${BASE_BRANCH}...HEAD" \
+          | grep '\.py$' \
+          | grep -v '/static/' \
+          | grep -v '__pycache__' \
+          | xargs -I{} sh -c '[ -f "{}" ] && echo "{}"' \
+          || true)
+
+        if [ -z "$FILES" ]; then
+          echo "No Python files to lint."
+          exit 0
+        fi
+
+        echo "Linting files:"
+        echo "$FILES"
+        echo "---"
+        echo "$FILES" | xargs flake8
+
+    - name: Generate app token
+      if: always()
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      if: always()
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Find existing static-checks comment
+      if: always()
+      id: find-comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        COMMENT_ID=$(gh api \
+          "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '[.[] | select(.body | contains("<!-- unifox-static-checks -->"))] | last | .id // ""')
+        echo "comment_id=${COMMENT_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Post or update summary comment
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        EXISTING_COMMENT_ID: ${{ steps.find-comment.outputs.comment_id }}
+        BRANCH: ${{ github.head_ref }}
+        MODULES: ${{ steps.detect.outputs.modules }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        BRANCH_OUTCOME: ${{ steps.branch.outcome }}
+        VERSION_OUTCOME: ${{ steps.version.outcome }}
+        MANIFEST_OUTCOME: ${{ steps.manifest.outcome }}
+        TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        LINT_OUTCOME: ${{ steps.lint.outcome }}
+      run: |
+        python3 - <<'PYEOF'
+        import os, subprocess
+        from datetime import datetime, timezone
+
+        def outcome_icon(o):
+            return {'success': '\u2705', 'failure': '\u274c', 'skipped': '\u23ed\ufe0f'}.get(o, '\u2705')
+
+        branch   = os.environ['BRANCH']
+        modules  = os.environ['MODULES']
+        existing = os.environ['EXISTING_COMMENT_ID'].strip()
+        pr       = os.environ['PR_NUMBER']
+        repo     = os.environ['REPO']
+        run_url  = os.environ['RUN_URL']
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        branch_ok   = os.environ['BRANCH_OUTCOME']
+        version_ok  = os.environ['VERSION_OUTCOME']
+        manifest_ok = os.environ['MANIFEST_OUTCOME']
+        tests_ok    = os.environ['TESTS_OUTCOME']
+        lint_ok     = os.environ['LINT_OUTCOME']
+
+        outcomes = [branch_ok, version_ok, manifest_ok, tests_ok, lint_ok]
+        overall  = '\u2705 All checks passed' if all(o in ('success', 'skipped') for o in outcomes) \
+                   else '\u274c One or more checks failed'
+
+        body = '\n'.join([
+            '<!-- unifox-static-checks -->',
+            '## \U0001f98a PR Static Checks',
+            '',
+            f'**Status:** {overall}',
+            '',
+            '| Check | Status |',
+            '|-------|--------|',
+            f'| Branch naming (`{branch}`) | {outcome_icon(branch_ok)} |',
+            f'| Version bump | {outcome_icon(version_ok)} |',
+            f'| Manifest & structure | {outcome_icon(manifest_ok)} |',
+            f'| Tests exist | {outcome_icon(tests_ok)} |',
+            f'| Lint (flake8) | {outcome_icon(lint_ok)} |',
+            '',
+            f'**Modified modules:** {modules or "_none (only non-module files changed)_"}',
+            '',
+            '---',
+            f'_Last verified: {timestamp} \u2014 [View full log]({run_url})_',
+        ])
+
+        open('/tmp/static-comment.md', 'w').write(body)
+
+        if existing and existing != 'null':
+            result = subprocess.run([
+                'gh', 'api', '--method', 'PATCH',
+                f'repos/{repo}/issues/comments/{existing}',
+                '--field', 'body=@/tmp/static-comment.md',
+            ], capture_output=True, text=True)
+        else:
+            result = subprocess.run([
+                'gh', 'pr', 'comment', pr, '--repo', repo,
+                '--body-file', '/tmp/static-comment.md',
+            ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(result.stderr)
+        print('Comment', 'updated' if existing and existing != 'null' else 'posted')
+        PYEOF
+
+    - name: Fail if any check failed
+      if: always()
+      shell: bash
+      env:
+        BRANCH_OUTCOME: ${{ steps.branch.outcome }}
+        VERSION_OUTCOME: ${{ steps.version.outcome }}
+        MANIFEST_OUTCOME: ${{ steps.manifest.outcome }}
+        TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        LINT_OUTCOME: ${{ steps.lint.outcome }}
+      run: |
+        failed=false
+        [ "$BRANCH_OUTCOME"   = "failure" ] && failed=true
+        [ "$VERSION_OUTCOME"  = "failure" ] && failed=true
+        [ "$MANIFEST_OUTCOME" = "failure" ] && failed=true
+        [ "$TESTS_OUTCOME"    = "failure" ] && failed=true
+        [ "$LINT_OUTCOME"     = "failure" ] && failed=true
+        $failed && exit 1 || exit 0

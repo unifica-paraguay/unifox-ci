@@ -1,0 +1,491 @@
+name: "unifox-ci: PR AI Code Review"
+description: >
+  Stateful AI code review using Claude. Reads previous bot review threads
+  (including resolution status) before calling Claude so it replies to
+  existing threads instead of duplicating, and stays consistent across pushes.
+  Enforces Odoo coding guidelines and git guidelines.
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key"
+    required: true
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  profile:
+    description: "Repository profile (odoo, default)"
+    required: false
+    default: "default"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate app token
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests
+
+    - name: Collect diff
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        git fetch origin "$BASE_BRANCH"
+        PY_DIFF=$(git diff "origin/${BASE_BRANCH}...HEAD" -- '*.py' ':!*/static/*' ':!*/__pycache__/*')
+        XML_DIFF=$(git diff "origin/${BASE_BRANCH}...HEAD" -- '*.xml')
+        MANIFEST_DIFF=$(git diff "origin/${BASE_BRANCH}...HEAD" -- '*/__manifest__.py')
+        {
+          echo "=== Python files ==="
+          echo "$PY_DIFF"
+          echo ""
+          echo "=== Manifest files ==="
+          echo "$MANIFEST_DIFF"
+          echo ""
+          echo "=== XML files ==="
+          echo "$XML_DIFF"
+        } | head -c 48000 > /tmp/review_diff.txt
+
+        BASE_BRANCH="${BASE_BRANCH}" python3 - <<'PYEOF'
+        import ast, os, subprocess
+        from pathlib import Path
+
+        base = os.environ.get('BASE_BRANCH', 'main')
+        result = subprocess.run(
+            ['git', 'diff', '--name-only', f'origin/{base}...HEAD', '--',
+             '*.py', ':!*/static/*', ':!*/__pycache__/*'],
+            capture_output=True, text=True,
+        )
+        changed = [f for f in result.stdout.strip().splitlines() if f and Path(f).exists()]
+
+        lines = [
+            '=== Existing docstring conventions in changed files ===',
+            '(Unchanged methods \u2014 these ARE the established convention)',
+            '',
+        ]
+
+        found = False
+        for fpath in changed:
+            try:
+                src = Path(fpath).read_text()
+                tree = ast.parse(src)
+                src_lines = src.splitlines()
+            except Exception:
+                continue
+            funcs = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    body = node.body
+                    if (body and isinstance(body[0], ast.Expr)
+                            and isinstance(body[0].value, ast.Constant)):
+                        doc_lineno = body[0].lineno - 1
+                        opening = src_lines[doc_lineno].strip() if doc_lineno < len(src_lines) else ''
+                        funcs.append(f'  def {node.name}():  {opening}')
+            if funcs:
+                found = True
+                lines.append(f'File: {fpath}')
+                lines.extend(funcs[:25])
+                lines.append('')
+
+        if not found:
+            lines.append('(no docstrings found in changed files)')
+
+        Path('/tmp/review_conventions.txt').write_text('\n'.join(lines))
+        print(f"Convention extraction: {len(changed)} file(s) scanned")
+        PYEOF
+
+    - name: Collect existing review context
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess
+
+        repo  = os.environ['REPO']
+        pr    = os.environ['PR_NUMBER']
+        owner, repo_name = repo.split('/', 1)
+
+        def gh_list(endpoint):
+            r = subprocess.run(['gh', 'api', '--paginate', endpoint],
+                               capture_output=True, text=True)
+            try:
+                return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else []
+            except Exception:
+                return []
+
+        all_reviews  = gh_list(f'repos/{repo}/pulls/{pr}/reviews')
+        all_comments = gh_list(f'repos/{repo}/pulls/{pr}/comments')
+
+        bot_reviews  = [r for r in all_reviews  if r.get('user', {}).get('type') == 'Bot']
+        bot_comments = [c for c in all_comments if c.get('user', {}).get('type') == 'Bot']
+
+        gql = (
+            'query($owner:String!,$repo:String!,$pr:Int!){'
+            'repository(owner:$owner,name:$repo){'
+            'pullRequest(number:$pr){'
+            'reviewThreads(first:100){'
+            'nodes{id isResolved '
+            'comments(first:10){nodes{databaseId path originalLine}}'
+            '}}}}}'
+        )
+        gql_r = subprocess.run([
+            'gh', 'api', 'graphql',
+            '-f', f'query={gql}',
+            '-f', f'owner={owner}',
+            '-f', f'repo={repo_name}',
+            '-F', f'pr={int(pr)}',
+        ], capture_output=True, text=True)
+
+        c2t = {}
+        if gql_r.returncode == 0:
+            nodes = (
+                (json.loads(gql_r.stdout).get('data') or {})
+                .get('repository', {})
+                .get('pullRequest', {})
+                .get('reviewThreads', {})
+                .get('nodes', [])
+            )
+            for t in nodes:
+                for c in t.get('comments', {}).get('nodes', []):
+                    c2t[c['databaseId']] = {
+                        'thread_id':   t['id'],
+                        'is_resolved': t['isResolved'],
+                    }
+
+        prev_comments = [{
+            'id':          c['id'],
+            'path':        c.get('path', ''),
+            'line':        c.get('original_line') or c.get('line'),
+            'body':        c.get('body', '')[:400],
+            'is_resolved': c2t.get(c['id'], {}).get('is_resolved', False),
+        } for c in bot_comments]
+
+        json.dump({
+            'prev_comments':     prev_comments,
+            'bot_review_ids':    [r['id'] for r in bot_reviews],
+            'comment_to_thread': {str(k): v for k, v in c2t.items()},
+        }, open('/tmp/review_context.json', 'w'), indent=2)
+
+        print(f"Bot reviews: {len(bot_reviews)}, comments: {len(bot_comments)}, threads: {len(c2t)}")
+        PYEOF
+
+    - name: Build and run review prompt
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BRANCH: ${{ github.head_ref }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        python3 - <<'PYEOF'
+        import json, os
+
+        ctx   = json.load(open('/tmp/review_context.json'))
+        diff  = open('/tmp/review_diff.txt').read()
+        prev  = ctx['prev_comments']
+        try:
+            conventions = open('/tmp/review_conventions.txt').read()
+        except FileNotFoundError:
+            conventions = ''
+
+        pending  = [c for c in prev if not c['is_resolved']]
+        resolved = [c for c in prev if c['is_resolved']]
+
+        if prev:
+            context_block = '\n'.join([
+                f"This is a follow-up review. You previously left {len(prev)} comment(s):",
+                "",
+                json.dumps(prev, indent=2),
+                "",
+                f"Pending (unresolved): {len(pending)}",
+                f"Already resolved: {len(resolved)}",
+                "",
+                "FOLLOW-UP RULES \u2014 strictly enforced:",
+                "- Pending issue NOW FIXED in the diff below \u2192 put in reply_to with resolved=true",
+                "- Pending issue STILL PRESENT and unchanged \u2192 put in reply_to with resolved=false; do NOT create a new_comment at that location",
+                "- Only genuinely NEW issues (not in the list above) go in new_comments",
+                "- NEVER duplicate a new_comment at a (path, line) that already has a pending comment",
+                "- NEVER approve while any pending issue remains unresolved",
+                "- Be consistent: if code was wrong before and has not changed, it is still wrong",
+            ])
+        else:
+            context_block = "This is the first review of this PR."
+
+        prompt_parts = [
+            "You are a senior Odoo developer performing a code review.",
+            "The Odoo coding guidelines and git guidelines are already included in your system prompt \u2014 apply them strictly.",
+            "",
+            f"PR title: {os.environ['PR_TITLE']}",
+            f"Branch:   {os.environ['PR_BRANCH']}",
+            f"Author:   {os.environ['PR_AUTHOR']}",
+            "",
+            context_block,
+            "",
+        ]
+
+        if conventions:
+            prompt_parts += [
+                conventions,
+                "",
+                "CONVENTION CHECK \u2014 strictly enforced:",
+                "Before flagging ANY formatting or style issue, look for the same pattern in the",
+                "'Existing conventions' section above. If an unchanged method uses the same pattern,",
+                "it IS the established convention for this codebase \u2014 mark it as correct, not an issue.",
+                "This applies to: docstring opening style, Note: self.ensure_one() lines, param/return",
+                "formatting, or any other style detail that appears in at least one existing method.",
+                "",
+            ]
+
+        prompt_parts += [
+            "Current diff (first 48 KB):",
+            "```diff",
+            diff,
+            "```",
+            "",
+            "Review checklist (apply Odoo coding guidelines strictly for each point):",
+            "1. Correctness: logic bugs, wrong Odoo API usage, missing super() calls in CRUD overrides",
+            "2. Security: SQL injection, unsafe eval(), unescaped user input in XML/QWeb",
+            "3. Odoo model conventions (flag as CHANGES_REQUESTED):",
+            "   - Wrong attribute order: _name/_description must come before fields",
+            "   - Field suffixes: Many2one must end in _id, One2many/Many2many in _ids",
+            "   - compute methods must be named _compute_<field_name>",
+            "   - onchange methods must be named _onchange_<field_name>",
+            "   - constraint methods must be named _check_<name>",
+            "   - action methods (called from buttons) must call self.ensure_one()",
+            "   - Imports must follow order: stdlib \u2192 odoo \u2192 third-party addons",
+            "   - No cr.commit() without explicit justification in a comment",
+            "   - No bare except Exception without savepoints",
+            "   - No _() around strings with % or .format() interpolation inside the call",
+            "4. XML conventions (flag as CHANGES_REQUESTED):",
+            "   - XML IDs must follow pattern: <module>.<model>_view_<type>",
+            "   - No hardcoded IDs; use ref() for cross-module references",
+            "5. Test coverage: missing tests for new public methods or new code paths",
+            "6. Manifest: version bump, correct depends, all new files listed in data/assets",
+            "7. Performance: N+1 queries, missing sudo() where appropriate, unnecessary iterations",
+            "8. Field naming: custom fields must use module prefix (e.g. bancard_public_key)",
+            "",
+            'Output ONLY a valid JSON object:',
+            '{',
+            '  "verdict": "APPROVED" | "CHANGES_REQUESTED" | "COMMENT",',
+            '  "summary": "1-3 sentence cumulative summary. If follow-up: mention resolved vs pending count.",',
+            '  "new_comments": [{"path": "file.py", "line": 42, "body": "Issue"}],',
+            '  "reply_to": [{"comment_id": 123456, "body": "Reply text", "resolved": true}]',
+            '}',
+            "",
+            "Rules:",
+            "- verdict=APPROVED only if zero pending issues and no new blocking issues",
+            "- verdict=CHANGES_REQUESTED if any item from checklist points 1-4 is violated",
+            "- verdict=COMMENT for non-blocking suggestions only",
+            "- new_comments: max 8 items, new issues only",
+            "- reply_to: one entry per previous comment that needs follow-up action",
+            "- All text in English \u2014 no markdown fences outside the JSON",
+        ]
+
+        open('/tmp/review_prompt.txt', 'w').write('\n'.join(prompt_parts))
+        print(f"Prompt written ({len('\n'.join(prompt_parts))} chars), follow-up={bool(prev)}")
+        PYEOF
+
+        python "${SCRIPTS_DIR}/claude_api.py" < /tmp/review_prompt.txt > /tmp/review_raw.json
+
+        python3 - <<'PYEOF'
+        import json
+
+        raw = open('/tmp/review_raw.json').read().strip()
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Warning: could not parse response ({e}) — safe fallback")
+            data = {'verdict': 'COMMENT', 'summary': 'Review parse error.', 'new_comments': [], 'reply_to': []}
+
+        if 'veredicto' in data and 'verdict' not in data:
+            data['verdict'] = data.pop('veredicto')
+        if data.get('verdict') not in ('APPROVED', 'CHANGES_REQUESTED', 'COMMENT'):
+            data['verdict'] = 'COMMENT'
+        data.setdefault('new_comments', [])
+        data.setdefault('reply_to', [])
+
+        json.dump(data, open('/tmp/review_parsed.json', 'w'), indent=2)
+        print(f"Verdict: {data['verdict']}, new_comments: {len(data['new_comments'])}, reply_to: {len(data['reply_to'])}")
+        PYEOF
+
+    - name: Execute review actions
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess, sys
+
+        ctx  = json.load(open('/tmp/review_context.json'))
+        data = json.load(open('/tmp/review_parsed.json'))
+        repo = os.environ['REPO']
+        pr   = os.environ['PR_NUMBER']
+        sha  = os.environ['SHA']
+        c2t  = {int(k): v for k, v in ctx['comment_to_thread'].items()}
+
+        def gh(endpoint, body=None, method=None):
+            cmd = ['gh', 'api']
+            if method:
+                cmd += ['--method', method]
+            if body is not None:
+                cmd += ['--input', '-']
+            cmd.append(endpoint)
+            kw = {'capture_output': True, 'text': True}
+            if body is not None:
+                kw['input'] = json.dumps(body)
+            return subprocess.run(cmd, **kw)
+
+        errors = []
+
+        for reply in data.get('reply_to', []):
+            cid  = reply.get('comment_id')
+            body = reply.get('body', '').strip()
+            if not cid or not body:
+                continue
+            r = gh(f'repos/{repo}/pulls/comments/{cid}/replies',
+                   body={'body': body}, method='POST')
+            if r.returncode != 0:
+                errors.append(f'reply {cid}: {r.stderr[:120]}')
+                continue
+            print(f'Replied to comment {cid}')
+
+            if reply.get('resolved') and cid in c2t:
+                tid = c2t[cid]['thread_id']
+                gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
+                       '{thread{id isResolved}}}')
+                r2 = subprocess.run(
+                    ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
+                    capture_output=True, text=True)
+                if r2.returncode != 0:
+                    errors.append(f'resolve thread {tid}: {r2.stderr[:120]}')
+                else:
+                    print(f'Resolved thread for comment {cid}')
+
+        for rid in ctx.get('bot_review_ids', []):
+            r = gh(f'repos/{repo}/pulls/{pr}/reviews/{rid}/dismissals',
+                   body={'message': 'Superseded by updated review'}, method='PUT')
+            if r.returncode != 0:
+                print(f'Warning: could not dismiss review {rid}')
+
+        prev        = ctx.get('prev_comments', [])
+        was_pending = sum(1 for c in prev if not c['is_resolved'])
+        newly_done  = sum(1 for re in data.get('reply_to', []) if re.get('resolved'))
+        now_pending = max(0, was_pending - newly_done)
+        now_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done
+        new_count   = len([c for c in data.get('new_comments', [])
+                           if c.get('path') and isinstance(c.get('line'), int)])
+
+        parts = []
+        if now_resolved:
+            parts.append(f'{now_resolved} resolved')
+        if now_pending:
+            parts.append(f'{now_pending} pending')
+        if new_count:
+            parts.append(f'{new_count} new')
+        status = ' \u00b7 '.join(parts) if parts else 'No issues found'
+
+        rev_body = '\n'.join([
+            '<!-- unifox-review -->',
+            '',
+            data.get('summary', ''),
+            '',
+            f'**Issues:** {status}',
+        ])
+
+        event_map = {
+            'APPROVED':          'APPROVE',
+            'CHANGES_REQUESTED': 'REQUEST_CHANGES',
+            'COMMENT':           'COMMENT',
+        }
+        event  = event_map.get(data.get('verdict', 'COMMENT'), 'COMMENT')
+        inline = [
+            {'path': c['path'], 'line': c['line'], 'body': c['body'], 'side': 'RIGHT'}
+            for c in data.get('new_comments', [])
+            if c.get('path') and isinstance(c.get('line'), int) and c.get('body')
+        ]
+
+        payload = {'commit_id': sha, 'body': rev_body, 'event': event, 'comments': inline}
+        r = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')
+        if r.returncode != 0:
+            payload['comments'] = []
+            r2 = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')
+            if r2.returncode != 0:
+                print(f'Error creating review: {r2.stderr}')
+                sys.exit(1)
+            print(f'Review submitted (no inline comments \u2014 line mismatch): {event}')
+        else:
+            print(f'Review submitted: {event}, {len(inline)} inline comments')
+
+        if errors:
+            print(f'Non-fatal errors ({len(errors)}): {errors}')
+        PYEOF
+
+    - name: Tag author if changes requested
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess, sys
+
+        try:
+            data = json.load(open('/tmp/review_parsed.json'))
+            ctx  = json.load(open('/tmp/review_context.json'))
+        except Exception:
+            sys.exit(0)
+
+        if data.get('verdict') != 'CHANGES_REQUESTED':
+            sys.exit(0)
+
+        prev       = ctx.get('prev_comments', [])
+        newly_done = sum(1 for r in data.get('reply_to', []) if r.get('resolved'))
+        pending    = max(0, sum(1 for c in prev if not c['is_resolved']) - newly_done)
+        new_cnt    = len(data.get('new_comments', []))
+        total      = pending + new_cnt
+
+        msg = (f"@{os.environ['PR_AUTHOR']} unifox-ci has requested changes "
+               f"({total} issue(s) pending). Please review the inline comments.")
+        subprocess.run([
+            'gh', 'pr', 'comment', os.environ['PR_NUMBER'],
+            '--repo', os.environ['REPO'], '--body', msg,
+        ], check=False)
+        PYEOF

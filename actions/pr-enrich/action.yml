@@ -1,0 +1,252 @@
+name: "unifox-ci: PR Enrich (title, description, reviewer assignment)"
+description: >
+  Uses Claude to evaluate and update the PR title and description.
+  Also assigns reviewers when the PR is first opened.
+  Title follows Odoo git guidelines: [TAG] scope: description.
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key"
+    required: true
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  profile:
+    description: "Repository profile (odoo, default)"
+    required: false
+    default: "default"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate app token
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests
+
+    - name: Collect diff for metadata
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        git fetch origin "$BASE_BRANCH"
+        git diff "origin/${BASE_BRANCH}...HEAD" -- \
+          '*.py' '*__manifest__.py' '*.xml' \
+          | head -c 32000 > /tmp/pr_diff.txt
+
+    - name: Generate or refresh title and description
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        PR_BRANCH: ${{ github.head_ref }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        EVENT_ACTION: ${{ github.event.action }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        DIFF=$(cat /tmp/pr_diff.txt)
+        COMMITS=$(git log "origin/${{ inputs.base_branch }}..HEAD" --oneline)
+
+        PROMPT="You are reviewing a pull request for an Odoo addons repository.
+
+        Event: ${EVENT_ACTION} (opened = first time, synchronize = new push, reopened = reopened)
+        PR branch: ${PR_BRANCH}
+        PR author: ${PR_AUTHOR}
+
+        Current title: ${PR_TITLE}
+        Current description:
+        ${PR_BODY}
+
+        Commits on this branch:
+        ${COMMITS}
+
+        Diff (first 32 KB):
+        ${DIFF}
+
+        Task:
+        Evaluate whether the current title and description accurately reflect the current state
+        of the PR (all commits and diff shown above).
+
+        Rules:
+        - If the current title and description are already accurate and complete, output exactly:
+          NO_UPDATE
+        - If the title or description is missing information, outdated, or inaccurate given the
+          current diff, output ONLY a JSON object:
+          {
+            \"title\": \"[TAG] scope: short description in English (imperative, < 72 chars)\",
+            \"body\": \"<full description following the template below>\"
+          }
+
+        Title format — STRICTLY follow Odoo git guidelines:
+          [TAG] scope: short description in English
+        Valid tags: [ADD] [FIX] [UPD] [REF] [REM] [MOV] [IMP] [REL] [MERGE] [REV] [CLN] [LINT] [PERF] [I18N] [CLA]
+        Scope is the module technical name or area (e.g. unifica_payment_bancard, .github, unifica_base).
+        Description is imperative mood, < 72 chars total for the entire title.
+        Examples:
+          [IMP] unifica_payment_bancard: complete docstrings for billing methods
+          [FIX] .github: fix workflow triggers and secret names
+          [ADD] unifica_base: add module filter views
+        NEVER use Conventional Commits format (feat:, fix:, chore:) — use the [TAG] format above.
+
+        Description template (English only):
+        ## Purpose
+        Why this change is being made — the business or technical problem being solved.
+        Focus on WHY, not WHAT (the diff shows what changed). 1-2 sentences max.
+
+        ## Changes
+        - **\`module_or_file\`** — what changed and why, one line each (max 6 bullets)
+        - Group minor related changes under the same bullet
+
+        ## Notes
+        (Only if needed: breaking changes, migration steps, dependencies, or anything
+        the reviewer must know before approving. Omit this section entirely if not needed.)
+
+        No markdown fences around the JSON. No explanation outside the JSON or NO_UPDATE."
+
+        python "${SCRIPTS_DIR}/claude_api.py" "$PROMPT" > /tmp/claude_meta_raw.txt
+        cat /tmp/claude_meta_raw.txt
+
+    - name: Apply title/description update if needed
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess, sys
+
+        raw = open('/tmp/claude_meta_raw.txt').read().strip()
+
+        if raw == 'NO_UPDATE':
+            print("Title and description are already accurate — no update needed.")
+            sys.exit(0)
+
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Warning: could not parse Claude response as JSON ({e}) — skipping update.")
+            sys.exit(0)
+
+        title = data.get('title', '').strip()
+        body  = data.get('body', '').strip()
+
+        if not title:
+            print("Warning: empty title in response — skipping update.")
+            sys.exit(0)
+
+        json.dump({'title': title, 'body': body}, open('/tmp/pr_update.json', 'w'))
+
+        result = subprocess.run([
+            'gh', 'api', '--method', 'PATCH',
+            f"repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{os.environ['PR_NUMBER']}",
+            '--input', '/tmp/pr_update.json',
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"Error updating PR: {result.stderr}")
+            sys.exit(1)
+
+        print(f"PR updated: {title}")
+        PYEOF
+
+    # Reviewer assignment — only runs when the PR is first opened
+    - name: Detect modified modules (for reviewer assignment)
+      id: detect
+      if: github.event.action == 'opened'
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+
+    - name: Choose reviewers
+      id: reviewers
+      if: github.event.action == 'opened'
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        MODULES: ${{ steps.detect.outputs.modules }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        PROMPT="A pull request was opened in an Odoo addons repository.
+
+        Author: ${PR_AUTHOR}
+        Modified Odoo modules: ${MODULES:-none}
+
+        Available reviewers:
+        - weckerleben (lead, payment & CI)
+
+        Rules:
+        - Never assign the author as reviewer.
+        - Assign 1-2 reviewers max.
+        - Prefer weckerleben for payment modules; assign by default if no specialty match.
+
+        Output ONLY a JSON object: {\"reviewers\": [\"username\"]}. No markdown, no explanation."
+
+        python "${SCRIPTS_DIR}/claude_api.py" "$PROMPT" > /tmp/reviewers_raw.json
+
+        python3 - <<'PYEOF'
+        import json
+        raw = open('/tmp/reviewers_raw.json').read().strip()
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0]
+        data = json.loads(raw)
+        reviewers = ','.join(data.get('reviewers', []))
+        open('/tmp/reviewers.txt', 'w').write(reviewers)
+        PYEOF
+
+    - name: Request review
+      if: github.event.action == 'opened'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        REVIEWERS=$(cat /tmp/reviewers.txt 2>/dev/null || echo "")
+        [ -z "$REVIEWERS" ] && echo "No reviewers selected." && exit 0
+
+        python3 -c "
+        import json
+        reviewers = '$REVIEWERS'.split(',')
+        print(json.dumps({'reviewers': [r.strip() for r in reviewers if r.strip()]}))
+        " > /tmp/review_req.json
+
+        gh api --method POST \
+          "repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+          --input /tmp/review_req.json

@@ -1,0 +1,47 @@
+# docker-compose.yml for running Odoo 19 tests in CI.
+# Shared by all three test layers:
+#   Layer 1 — pr-odoo-tests.yml       (modified modules, fast, blocks merge)
+#   Layer 2 — pr-dependency-tests.yml (native Odoo deps, regression, blocks merge)
+#   Layer 3 — nightly-full-tests.yml  (full suite, scheduled, opens issue on failure)
+#
+# The command is overridden at runtime via `docker compose run odoo odoo ...`.
+# REPO_ROOT must be set in the calling environment so the volume mount resolves.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  odoo:
+    image: odoo:19
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount the repo root as Odoo extra-addons.
+      # In CI this path is set via the REPO_ROOT env variable; locally use ../../
+      - ${REPO_ROOT:-../../}:/mnt/extra-addons:ro
+      - ./odoo.conf:/etc/odoo/odoo.conf:ro
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: odoo
+    # Override command at runtime to inject module list, e.g.:
+    #   docker compose run --rm odoo odoo -d test_db --test-enable --stop-after-init -i unifica_payment_bancard
+    command: >
+      odoo
+        -d test_db
+        --db_host db
+        --db_user odoo
+        --db_password odoo
+        --test-enable
+        --stop-after-init
+        -i ${MODULES:-unifica_base}

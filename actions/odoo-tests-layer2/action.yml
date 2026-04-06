@@ -1,0 +1,258 @@
+name: "unifox-ci: Odoo Tests — Layer 2 (native dependencies)"
+description: >
+  Runs Odoo tests for native (non-unifica_*) dependencies of modified modules.
+  Catches regressions in upstream modules our patches touch. Blocks merge on failure.
+
+inputs:
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  profile:
+    description: "Repository profile (odoo, default)"
+    required: false
+    default: "default"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect modified modules
+      id: detect
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        echo "Modified modules: ${MODS:-none}"
+
+    - name: Extract native Odoo dependencies
+      id: deps
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        MODULES: ${{ steps.detect.outputs.modules }}
+      run: |
+        python3 - <<'PYEOF'
+        import ast, os, re, sys
+        from pathlib import Path
+
+        modules     = os.environ['MODULES'].split()
+        native_deps = set()
+
+        for mod in modules:
+            manifest = Path(mod) / '__manifest__.py'
+            if not manifest.exists():
+                continue
+            content = manifest.read_text()
+            try:
+                data    = ast.literal_eval(ast.parse(content, mode='eval'))
+                depends = data.get('depends', [])
+            except Exception:
+                m = re.search(r"['\"]depends['\"]\s*:\s*\[([^\]]+)\]", content, re.DOTALL)
+                depends = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1)) if m else []
+
+            for dep in depends:
+                if not dep.startswith('unifica_'):
+                    native_deps.add(dep)
+
+        native_deps.discard('base')
+        result = ' '.join(sorted(native_deps))
+        print(f"Native deps to test: {result or 'none'}")
+
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"native_deps={result}\n")
+        PYEOF
+
+    - name: Pull Odoo image
+      if: steps.deps.outputs.native_deps != '' && steps.detect.outputs.modules != ''
+      shell: bash
+      run: docker pull odoo:19 || true
+
+    - name: Start PostgreSQL
+      if: steps.deps.outputs.native_deps != '' && steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" up -d db
+
+    - name: Wait for PostgreSQL
+      if: steps.deps.outputs.native_deps != '' && steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        for i in $(seq 1 24); do
+          docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+            exec -T db pg_isready -U odoo && break
+          echo "  attempt $i/24 — sleeping 5s..."
+          sleep 5
+        done
+
+    - name: Run native dependency tests
+      id: odoo-run
+      if: steps.deps.outputs.native_deps != '' && steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        REPO_ROOT: ${{ github.workspace }}
+        NATIVE_DEPS: ${{ steps.deps.outputs.native_deps }}
+        MODIFIED_MODULES: ${{ steps.detect.outputs.modules }}
+      run: |
+        MODULES_CSV=$(echo "$NATIVE_DEPS" | tr ' ' ',')
+        TAGS=$(echo "$NATIVE_DEPS" | tr ' ' '\n' | sed 's|^|/|' | paste -sd ',')
+        UNIFICA_CSV=$(echo "$MODIFIED_MODULES" | tr ' ' ',')
+
+        echo "Native modules: $MODULES_CSV"
+        echo "Test tags: $TAGS"
+
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+          run --rm -e REPO_ROOT="${REPO_ROOT}" odoo \
+          odoo \
+            -d test_db --db_host db --db_user odoo --db_password odoo \
+            --test-enable --stop-after-init \
+            -i "${UNIFICA_CSV},${MODULES_CSV}" --test-tags "$TAGS" \
+          2>&1 | tee /tmp/dep-test-output.txt
+
+        if grep -qE "^(FAIL|ERROR):" /tmp/dep-test-output.txt; then
+          echo "::error::Regression detected in a native Odoo dependency."
+          exit 1
+        fi
+
+    - name: Tear down Docker services
+      if: always()
+      shell: bash
+      run: |
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+          down -v --remove-orphans || true
+
+    - name: Generate app token
+      if: always()
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      if: always()
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Find existing Layer 2 comment
+      if: always()
+      id: find-comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        COMMENT_ID=$(gh api \
+          "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '[.[] | select(.body | contains("<!-- unifox-tests-layer2 -->"))] | last | .id // ""')
+        echo "comment_id=${COMMENT_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Build and post comment
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        OUTCOME: ${{ steps.odoo-run.outcome }}
+        MODIFIED_MODULES: ${{ steps.detect.outputs.modules }}
+        NATIVE_DEPS: ${{ steps.deps.outputs.native_deps }}
+        EXISTING_COMMENT_ID: ${{ steps.find-comment.outputs.comment_id }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        python3 - <<'PYEOF'
+        import os, re, subprocess
+        from datetime import datetime, timezone
+
+        outcome   = os.environ['OUTCOME']
+        modified  = os.environ['MODIFIED_MODULES'].split() if os.environ['MODIFIED_MODULES'] else []
+        native    = os.environ['NATIVE_DEPS'].split() if os.environ['NATIVE_DEPS'] else []
+        run_url   = os.environ['RUN_URL']
+        existing  = os.environ['EXISTING_COMMENT_ID'].strip()
+        pr        = os.environ['PR_NUMBER']
+        repo      = os.environ['REPO']
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        output = open('/tmp/dep-test-output.txt').read() \
+            if os.path.exists('/tmp/dep-test-output.txt') else ''
+
+        def module_failed(mod):
+            return bool(re.search(
+                rf'^(?:FAIL|ERROR):[^\n]*\b{re.escape(mod)}\b', output, re.MULTILINE))
+
+        overall_failed = bool(re.search(r'^(?:FAIL|ERROR):', output, re.MULTILINE))
+
+        if outcome == 'skipped' or not native:
+            status_line = '**Status:** \u23ed\ufe0f Skipped \u2014 no native dependencies to test'
+        elif overall_failed or outcome == 'failure':
+            fail_count = len(re.findall(r'^FAIL:', output, re.MULTILINE))
+            status_line = f'**Status:** \u274c {fail_count} test(s) failed'
+        else:
+            status_line = '**Status:** \u2705 No regressions detected'
+
+        mod_list = ', '.join(f'`{m}`' for m in modified) if modified else '_none_'
+
+        if native:
+            rows = ['| Module | Status |', '|--------|--------|']
+            for mod in native:
+                rows.append(f'| `{mod}` | {"\u274c Failed" if module_failed(mod) else "\u2705 Passed"} |')
+            deps_section = '### Native dependencies tested\n\n' + '\n'.join(rows)
+        else:
+            deps_section = '_No native dependencies to test._'
+
+        snippet = '\n'.join(output.splitlines()[-80:]) if output else '_No output._'
+
+        body = '\n'.join([
+            '<!-- unifox-tests-layer2 -->',
+            '## \U0001f98a Odoo Tests \u2014 Layer 2 (native dependencies)',
+            '',
+            status_line,
+            '',
+            f'**Modified modules:** {mod_list}',
+            '',
+            deps_section,
+            '',
+            '<details>',
+            '<summary>\U0001f4cb Test output (last 80 lines)</summary>',
+            '',
+            '```',
+            snippet,
+            '```',
+            '</details>',
+            '',
+            '---',
+            f'_Last verified: {timestamp} \u2014 [View full log]({run_url})_',
+        ])
+
+        open('/tmp/layer2-comment.md', 'w').write(body)
+
+        if existing and existing != 'null':
+            result = subprocess.run([
+                'gh', 'api', '--method', 'PATCH',
+                f'repos/{repo}/issues/comments/{existing}',
+                '--field', 'body=@/tmp/layer2-comment.md',
+            ], capture_output=True, text=True)
+        else:
+            result = subprocess.run([
+                'gh', 'pr', 'comment', pr, '--repo', repo,
+                '--body-file', '/tmp/layer2-comment.md',
+            ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(result.stderr); raise SystemExit(1)
+        print('Comment', 'updated' if existing and existing != 'null' else 'posted')
+        PYEOF

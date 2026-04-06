@@ -1,0 +1,45 @@
+# unifox-ci profile: odoo
+# Rules and context specific to Odoo addons repositories.
+
+name: odoo
+description: "Profile for Odoo addons repositories"
+
+# Guidelines loaded into Claude's system prompt
+guidelines:
+  - coding_guidelines.rst   # Python, XML, JS, SCSS Odoo conventions
+  - git_guidelines.rst      # Commit format [TAG] module: description
+
+# Branch naming convention for PRs
+branch_pattern: "^release[/-]"
+branch_hint: "Branches must start with 'release/' or 'release-'"
+
+# Module detection
+module_manifest: "__manifest__.py"
+module_prefix: "unifica_"  # modules matching this prefix are "internal"
+
+# Version format
+version_format: "19.0.X.Y.Z"
+version_bump_rules:
+  major: "breaking changes, schema changes requiring migration"
+  minor: "new features, new fields, new methods, new XML views"
+  patch: "bug fixes, data corrections, CI/test-only changes"
+
+# Test runner
+test_runner: odoo
+odoo_image: "odoo:19"
+postgres_image: "postgres:16-alpine"
+
+# Lint
+linters:
+  - flake8
+
+# Required manifest fields
+manifest_required:
+  - name
+  - version
+  - depends
+  - license
+
+manifest_unifica:
+  author: "Unifica Paraguay"
+  website: "https://www.unificadesign.com.py"

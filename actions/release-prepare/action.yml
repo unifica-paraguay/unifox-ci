@@ -1,0 +1,267 @@
+name: "unifox-ci: Release Prepare"
+description: >
+  Generates a changelog with Claude, creates the git tag,
+  and publishes a GitHub Release (draft by default).
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key"
+    required: true
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  release_tag:
+    description: "Release tag (e.g. v19.0.3.0.0)"
+    required: true
+  target_branch:
+    description: "Target branch"
+    required: false
+    default: "19.0"
+  draft:
+    description: "Create as draft release (true/false)"
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate app token
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests
+
+    - name: Validate tag format
+      shell: bash
+      run: |
+        TAG="${{ inputs.release_tag }}"
+        if [[ ! "$TAG" =~ ^v19\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "ERROR: Tag '$TAG' does not follow the pattern v19.X.Y.Z.W"
+          echo "       Example: v19.0.3.1.0"
+          exit 1
+        fi
+        echo "Tag format OK: $TAG"
+
+    - name: Detect last release tag
+      id: last-tag
+      shell: bash
+      run: |
+        LAST=$(git tag --list 'v19.*' --sort=-version:refname | head -n1)
+        if [ -z "$LAST" ]; then
+          LAST=$(git rev-list --max-parents=0 HEAD)
+          echo "No previous tag found, using first commit: $LAST"
+        else
+          echo "Last release tag: $LAST"
+        fi
+        echo "last_tag=${LAST}" >> "$GITHUB_OUTPUT"
+
+    - name: Collect commits since last release
+      shell: bash
+      env:
+        LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+      run: |
+        git log "${LAST_TAG}..HEAD" \
+          --pretty=format:"%H|%s|%an|%ad" \
+          --date=short \
+          > /tmp/commits_raw.txt
+        echo "Commits found: $(wc -l < /tmp/commits_raw.txt)"
+
+    - name: Collect module versions
+      shell: bash
+      run: |
+        python3 - <<'PYEOF'
+        import re
+        from pathlib import Path
+        import json
+
+        versions = {}
+        for manifest in sorted(Path('.').glob('unifica_*/__manifest__.py')):
+            module = manifest.parent.name
+            content = manifest.read_text()
+            m = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", content)
+            if m:
+                versions[module] = m.group(1)
+
+        with open('/tmp/module_versions.json', 'w') as f:
+            json.dump(versions, f, ensure_ascii=False, indent=2)
+        print(json.dumps(versions, ensure_ascii=False, indent=2))
+        PYEOF
+
+    - name: Generate changelog with Claude
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        RELEASE_TAG: ${{ inputs.release_tag }}
+        LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        COMMITS=$(cat /tmp/commits_raw.txt)
+        VERSIONS=$(cat /tmp/module_versions.json)
+
+        PROMPT="Generate a professional release changelog for an Odoo 19 addons repository.
+
+        Release: ${RELEASE_TAG}
+        Previous release: ${LAST_TAG}
+
+        Current module versions:
+        ${VERSIONS}
+
+        Commits since last release (format: SHA|subject|author|date):
+        ${COMMITS}
+
+        Instructions:
+        1. Group commits by category: New features, Improvements, Bug fixes, Infrastructure/CI, Other
+        2. Use Odoo commit tags as hints: [ADD]=New features, [IMP]=Improvements, [FIX]=Bug fixes, [UPD]=Improvements or Infrastructure
+        3. Skip merge commits, version bump commits, and CI-only commits in the main sections
+        4. Write commit descriptions in English, making them human-readable
+        5. Include a brief (2-3 sentence) release summary at the top
+
+        Output ONLY a JSON object:
+        {
+          \"summary\": \"2-3 sentence summary\",
+          \"sections\": {
+            \"New features\": [],
+            \"Improvements\": [],
+            \"Bug fixes\": [],
+            \"Infrastructure/CI\": [],
+            \"Other\": []
+          },
+          \"breaking_changes\": [],
+          \"upgrade_notes\": \"Special upgrade instructions or empty string\"
+        }
+
+        Omit sections that have no items. No markdown fences, no explanation outside the JSON."
+
+        python "${SCRIPTS_DIR}/claude_api.py" "$PROMPT" > /tmp/changelog_raw.json
+
+        python3 - <<'PYEOF'
+        import json
+        raw = open('/tmp/changelog_raw.json').read().strip()
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0]
+        data = json.loads(raw)
+        with open('/tmp/changelog_parsed.json', 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print("Changelog parsed successfully")
+        PYEOF
+
+    - name: Render changelog as Markdown
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ inputs.release_tag }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os
+
+        data = json.load(open('/tmp/changelog_parsed.json'))
+        versions = json.load(open('/tmp/module_versions.json'))
+        tag = os.environ['RELEASE_TAG']
+
+        lines = [f"# Changelog \u2014 {tag}", '', data.get('summary', ''), '']
+
+        breaking = data.get('breaking_changes', [])
+        if breaking:
+            lines += ['\u26a0\ufe0f **Breaking changes**', '']
+            lines += [f'- {item}' for item in breaking]
+            lines.append('')
+
+        sections = data.get('sections', {})
+        for section_name in ['New features', 'Improvements', 'Bug fixes', 'Infrastructure/CI', 'Other']:
+            items = sections.get(section_name, [])
+            if not items:
+                continue
+            lines += [f'## {section_name}', '']
+            lines += [f'- {item}' for item in items]
+            lines.append('')
+
+        upgrade = data.get('upgrade_notes', '').strip()
+        if upgrade:
+            lines += ['## Upgrade notes', '', upgrade, '']
+
+        lines += ['## Module versions', '', '| Module | Version |', '|--------|---------|']
+        for mod, ver in sorted(versions.items()):
+            lines.append(f'| `{mod}` | `{ver}` |')
+        lines += ['', '---', '*Generated automatically by unifox-ci*']
+
+        changelog = '\n'.join(lines)
+        with open('/tmp/changelog.md', 'w') as f:
+            f.write(changelog)
+        print(f"Changelog rendered: {len(changelog)} chars")
+        PYEOF
+
+    - name: Create git tag
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+      run: |
+        git config user.name "unifox-ci[bot]"
+        git config user.email "unifox-ci[bot]@users.noreply.github.com"
+
+        TAG="${{ inputs.release_tag }}"
+        if git rev-parse "$TAG" >/dev/null 2>&1; then
+          echo "Tag $TAG already exists — skipping tag creation."
+        else
+          git tag -a "$TAG" -m "Release $TAG"
+          git remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push origin "$TAG"
+          echo "Tag $TAG created and pushed."
+        fi
+
+    - name: Create GitHub Release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+      run: |
+        TAG="${{ inputs.release_tag }}"
+        DRAFT="${{ inputs.draft }}"
+        [ "$DRAFT" = "true" ] && DRAFT_FLAG="--draft" || DRAFT_FLAG=""
+
+        EXISTING=$(gh release view "$TAG" --repo "$REPO" 2>/dev/null || echo "")
+        if [ -n "$EXISTING" ]; then
+          echo "Release $TAG already exists — updating body."
+          gh release edit "$TAG" --repo "$REPO" --notes-file /tmp/changelog.md
+        else
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "Release $TAG" \
+            --notes-file /tmp/changelog.md \
+            --target "${{ inputs.target_branch }}" \
+            $DRAFT_FLAG
+        fi
+
+        echo ""
+        echo "Release URL:"
+        gh release view "$TAG" --repo "$REPO" --json url --jq '.url'
+
+    - name: Post summary
+      shell: bash
+      run: |
+        TAG="${{ inputs.release_tag }}"
+        echo "## Release $TAG ready" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        cat /tmp/changelog.md >> "$GITHUB_STEP_SUMMARY"

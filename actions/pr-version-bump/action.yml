@@ -1,0 +1,342 @@
+name: "unifox-ci: PR Version Bump"
+description: >
+  AI-driven version bump for Odoo module manifests.
+  Detects modified modules, asks Claude for the correct version,
+  applies the bump, and commits to the PR branch.
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key"
+    required: true
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  profile:
+    description: "Repository profile (odoo, default)"
+    required: false
+    default: "default"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate app token
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests
+
+    - name: Detect modified modules
+      id: detect
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        echo "Modified modules: ${MODS:-none}"
+
+    - name: Find existing bump comment
+      id: existing-comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        COMMENT_ID=$(gh api \
+          "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '[.[] | select(.body | startswith("<!-- unifox-bump -->"))] | last | .id // ""')
+        echo "comment_id=${COMMENT_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Skip if no modules
+      if: steps.detect.outputs.modules == ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        EXISTING_COMMENT_ID: ${{ steps.existing-comment.outputs.comment_id }}
+        REPO: ${{ github.repository }}
+      run: |
+        TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+        printf '<!-- unifox-bump -->\n\n## :robot: unifox-ci \u2014 Version Bump\n\n**Status:** \u23ed\ufe0f No Odoo modules modified \u2014 skipped.\n\n_Last checked: %s_\n' \
+          "${TIMESTAMP}" > /tmp/bump-skip-body.txt
+
+        EXISTING="${EXISTING_COMMENT_ID}"
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+          gh api --method PATCH \
+            "repos/${REPO}/issues/comments/${EXISTING}" \
+            --field "body=@/tmp/bump-skip-body.txt"
+        fi
+
+    - name: Collect diff for version analysis
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+        MODULES: ${{ steps.detect.outputs.modules }}
+      run: |
+        git fetch origin "$BASE_BRANCH"
+        for MOD in $MODULES; do
+          echo "=== Module: $MOD ==="
+          git diff "origin/${BASE_BRANCH}...HEAD" -- "${MOD}/" || true
+          echo ""
+        done | head -c 32000 > /tmp/bump_diff.txt
+
+    - name: Read current versions
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        MODULES: ${{ steps.detect.outputs.modules }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, re, subprocess
+        from pathlib import Path
+
+        modules = os.environ['MODULES'].split()
+        base    = os.environ['BASE_BRANCH']
+        versions = {}
+
+        for mod in modules:
+            manifest = f"{mod}/__manifest__.py"
+            try:
+                base_txt = subprocess.check_output(
+                    ['git', 'show', f'origin/{base}:{manifest}'],
+                    stderr=subprocess.DEVNULL, text=True)
+                m = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", base_txt)
+                base_ver = m.group(1) if m else 'unknown'
+            except subprocess.CalledProcessError:
+                base_ver = 'new'
+
+            try:
+                txt = Path(manifest).read_text()
+                m = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", txt)
+                pr_ver = m.group(1) if m else 'unknown'
+            except FileNotFoundError:
+                pr_ver = 'unknown'
+
+            versions[mod] = {'base': base_ver, 'pr': pr_ver}
+            print(f"{mod}: base={base_ver}  pr={pr_ver}")
+
+        json.dump(versions, open('/tmp/versions.json', 'w'))
+        PYEOF
+
+    - name: Ask Claude for version recommendation
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        DIFF=$(cat /tmp/bump_diff.txt)
+        VERSIONS=$(cat /tmp/versions.json)
+
+        PROMPT="You are analyzing a pull request for an Odoo 19 addons repository.
+
+        Modified modules and their current versions (base branch \u2192 PR branch):
+        ${VERSIONS}
+
+        Odoo version format: 19.0.X.Y.Z
+        Semver rules for the X.Y.Z portion:
+        - X (major): breaking changes, schema changes requiring migration
+        - Y (minor): new features, new fields, new methods, new XML views
+        - Z (patch): bug fixes, data corrections, CI/test-only changes
+
+        Diff of changed modules:
+        \`\`\`diff
+        ${DIFF}
+        \`\`\`
+
+        For each module determine:
+        1. Whether a version bump is needed (if the PR branch already bumped correctly, action = 'none')
+        2. What the correct new version should be (19.0.X.Y.Z)
+        3. A one-line justification in English
+
+        Output ONLY a JSON object:
+        {
+          \"modules\": {
+            \"module_name\": {
+              \"action\": \"none\" | \"bump\",
+              \"current_version\": \"19.0.X.Y.Z\",
+              \"recommended_version\": \"19.0.X.Y.Z\",
+              \"reason\": \"One-line justification in English\"
+            }
+          },
+          \"summary\": \"Overall summary in English (1-2 sentences)\"
+        }
+
+        Rules:
+        - action 'none': recommended_version equals current_version (already correct)
+        - New module (base = 'new'): recommended_version = '19.0.1.0.0'
+        - Never downgrade versions
+        - No markdown fences, no explanation outside the JSON"
+
+        python "${SCRIPTS_DIR}/claude_api.py" "$PROMPT" > /tmp/bump_raw.json
+
+        python3 - <<'PYEOF'
+        import json
+        raw = open('/tmp/bump_raw.json').read().strip()
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0]
+        data = json.loads(raw)
+        json.dump(data, open('/tmp/bump_parsed.json', 'w'), ensure_ascii=False, indent=2)
+        needs = any(v.get('action') == 'bump' for v in data.get('modules', {}).values())
+        print(f"Needs bump: {needs}")
+        PYEOF
+
+    - name: Apply version bumps
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        python3 - <<'PYEOF'
+        import json, re
+        from pathlib import Path
+
+        data   = json.load(open('/tmp/bump_parsed.json'))
+        bumped = []
+
+        for mod, info in data.get('modules', {}).items():
+            if info.get('action') != 'bump':
+                continue
+            new_ver  = info['recommended_version']
+            manifest = Path(f"{mod}/__manifest__.py")
+            if not manifest.exists():
+                print(f"Warning: {manifest} not found")
+                continue
+            content = manifest.read_text()
+            updated = re.sub(
+                r"(['\"]version['\"]\s*:\s*['\"])(19\.\d+\.\d+\.\d+\.\d+)(['\"])",
+                lambda m: f"{m.group(1)}{new_ver}{m.group(3)}",
+                content,
+            )
+            if updated == content:
+                print(f"Warning: version pattern not found in {manifest}")
+                continue
+            manifest.write_text(updated)
+            bumped.append(f"{mod}: {info['current_version']} -> {new_ver}")
+            print(f"Bumped {manifest}")
+
+        open('/tmp/bumped_modules.txt', 'w').write('\n'.join(bumped))
+        print(f"Total bumped: {len(bumped)}")
+        PYEOF
+
+    - name: Commit bumps (if any)
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        HEAD_REF: ${{ github.head_ref }}
+        REPO: ${{ github.repository }}
+      run: |
+        BUMPED=$(cat /tmp/bumped_modules.txt)
+        if [ -z "$BUMPED" ]; then
+          echo "No files to commit."
+          exit 0
+        fi
+
+        git config user.name "unifox-ci[bot]"
+        git config user.email "unifox-ci[bot]@users.noreply.github.com"
+        find . -name '__manifest__.py' -exec git add {} \;
+
+        if [ -z "$(git diff --cached --name-only)" ]; then
+          echo "No staged changes."
+          exit 0
+        fi
+
+        git commit -m "[UPD] manifests: bump versions via unifox-ci
+
+        ${BUMPED}"
+
+        git remote set-url origin \
+          "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+        git push origin "HEAD:${HEAD_REF}"
+
+    - name: Post or update bump comment
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        EXISTING_COMMENT_ID: ${{ steps.existing-comment.outputs.comment_id }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess
+        from datetime import datetime, timezone
+
+        data     = json.load(open('/tmp/bump_parsed.json'))
+        existing = os.environ.get('EXISTING_COMMENT_ID', '').strip()
+        repo     = os.environ['REPO']
+        pr       = os.environ['PR_NUMBER']
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        summary = data.get('summary', '')
+        all_ok  = all(v.get('action') == 'none' for v in data.get('modules', {}).values())
+        status  = '\u2705 All versions are correct' if all_ok else '\u2b06\ufe0f Version bump applied'
+
+        lines = [
+            '<!-- unifox-bump -->',
+            '',
+            '## :robot: unifox-ci \u2014 Version Bump',
+            '',
+            f'**Status:** {status}',
+            '',
+            summary,
+            '',
+            '| Module | Previous | New | Action | Reason |',
+            '|--------|----------|-----|--------|--------|',
+        ]
+
+        for mod, info in data.get('modules', {}).items():
+            icon  = '\u2705 no change' if info['action'] == 'none' else '\u2b06\ufe0f bumped'
+            lines.append(
+                f"| `{mod}` | `{info['current_version']}` | "
+                f"`{info['recommended_version']}` | {icon} | {info.get('reason', '')} |"
+            )
+
+        lines += ['', f'_Last checked: {timestamp}_']
+        body = '\n'.join(lines)
+        open('/tmp/bump_comment.txt', 'w').write(body)
+
+        if existing and existing != 'null':
+            result = subprocess.run([
+                'gh', 'api', '--method', 'PATCH',
+                f'repos/{repo}/issues/comments/{existing}',
+                '--field', 'body=@/tmp/bump_comment.txt',
+            ], capture_output=True, text=True)
+        else:
+            result = subprocess.run([
+                'gh', 'pr', 'comment', pr, '--repo', repo,
+                '--body-file', '/tmp/bump_comment.txt',
+            ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(result.stderr); raise SystemExit(1)
+        print('Comment', 'updated' if existing and existing != 'null' else 'posted')
+        PYEOF

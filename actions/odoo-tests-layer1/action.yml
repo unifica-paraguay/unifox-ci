@@ -1,0 +1,212 @@
+name: "unifox-ci: Odoo Tests — Layer 1 (modified modules)"
+description: >
+  Runs Odoo tests for modified modules only using Docker.
+  Fast feedback loop — blocks merge on failure.
+
+inputs:
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  profile:
+    description: "Repository profile (odoo, default)"
+    required: false
+    default: "default"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect modified modules
+      id: detect
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        echo "Modules to test: ${MODS:-none}"
+
+    - name: Pull Odoo image
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      run: docker pull odoo:19 || true
+
+    - name: Start PostgreSQL
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" up -d db
+
+    - name: Wait for PostgreSQL
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      run: |
+        for i in $(seq 1 24); do
+          docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+            exec -T db pg_isready -U odoo && break
+          echo "  attempt $i/24 — sleeping 5s..."
+          sleep 5
+        done
+
+    - name: Run Odoo tests
+      id: odoo-run
+      if: steps.detect.outputs.modules != ''
+      shell: bash
+      env:
+        REPO_ROOT: ${{ github.workspace }}
+      run: |
+        MODULES_CSV=$(echo "${{ steps.detect.outputs.modules }}" | tr ' ' ',')
+        TAGS=$(echo "${{ steps.detect.outputs.modules }}" | tr ' ' '\n' \
+          | sed 's|^|/|' | paste -sd ',')
+
+        echo "Modules: $MODULES_CSV"
+        echo "Test tags: $TAGS"
+
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+          run --rm -e REPO_ROOT="${REPO_ROOT}" odoo \
+          odoo \
+            -d test_db --db_host db --db_user odoo --db_password odoo \
+            --test-enable --stop-after-init \
+            -i "$MODULES_CSV" --test-tags "$TAGS" \
+          2>&1 | tee /tmp/odoo-test-output.txt
+
+        if grep -qE "^(FAIL|ERROR):" /tmp/odoo-test-output.txt; then
+          echo "::error::Test failures detected in Odoo output."
+          exit 1
+        fi
+
+    - name: Tear down Docker services
+      if: always()
+      shell: bash
+      run: |
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+          down -v --remove-orphans || true
+
+    - name: Generate app token
+      if: always()
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      if: always()
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Find existing Layer 1 comment
+      if: always()
+      id: find-comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        COMMENT_ID=$(gh api \
+          "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '[.[] | select(.body | contains("<!-- unifox-tests-layer1 -->"))] | last | .id // ""')
+        echo "comment_id=${COMMENT_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Build and post comment
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        OUTCOME: ${{ steps.odoo-run.outcome }}
+        MODULES: ${{ steps.detect.outputs.modules }}
+        EXISTING_COMMENT_ID: ${{ steps.find-comment.outputs.comment_id }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        python3 - <<'PYEOF'
+        import os, re, subprocess
+        from datetime import datetime, timezone
+
+        outcome   = os.environ['OUTCOME']
+        modules   = os.environ['MODULES'].split() if os.environ['MODULES'] else []
+        run_url   = os.environ['RUN_URL']
+        existing  = os.environ['EXISTING_COMMENT_ID'].strip()
+        pr        = os.environ['PR_NUMBER']
+        repo      = os.environ['REPO']
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        output = open('/tmp/odoo-test-output.txt').read() \
+            if os.path.exists('/tmp/odoo-test-output.txt') else ''
+
+        def module_failed(mod):
+            return bool(re.search(
+                rf'^(?:FAIL|ERROR):[^\n]*\b{re.escape(mod)}\b', output, re.MULTILINE))
+
+        overall_failed = bool(re.search(r'^(?:FAIL|ERROR):', output, re.MULTILINE))
+
+        if outcome == 'skipped' or not modules:
+            status_line = '**Status:** \u23ed\ufe0f Skipped \u2014 no modules modified'
+        elif overall_failed or outcome == 'failure':
+            fail_count = len(re.findall(r'^FAIL:', output, re.MULTILINE))
+            status_line = f'**Status:** \u274c {fail_count} test(s) failed'
+        else:
+            status_line = '**Status:** \u2705 All tests passed'
+
+        if modules:
+            rows = ['| Module | Status |', '|--------|--------|']
+            for mod in modules:
+                rows.append(f'| `{mod}` | {"\u274c Failed" if module_failed(mod) else "\u2705 Passed"} |')
+            modules_section = '### Modules tested\n\n' + '\n'.join(rows)
+        else:
+            modules_section = '_No modules modified._'
+
+        snippet = '\n'.join(output.splitlines()[-80:]) if output else '_No output._'
+
+        body = '\n'.join([
+            '<!-- unifox-tests-layer1 -->',
+            '## \U0001f98a Odoo Tests \u2014 Layer 1',
+            '',
+            status_line,
+            '',
+            modules_section,
+            '',
+            '<details>',
+            '<summary>\U0001f4cb Test output (last 80 lines)</summary>',
+            '',
+            '```',
+            snippet,
+            '```',
+            '</details>',
+            '',
+            '---',
+            f'_Last verified: {timestamp} \u2014 [View full log]({run_url})_',
+        ])
+
+        open('/tmp/layer1-comment.md', 'w').write(body)
+
+        if existing and existing != 'null':
+            result = subprocess.run([
+                'gh', 'api', '--method', 'PATCH',
+                f'repos/{repo}/issues/comments/{existing}',
+                '--field', 'body=@/tmp/layer1-comment.md',
+            ], capture_output=True, text=True)
+        else:
+            result = subprocess.run([
+                'gh', 'pr', 'comment', pr, '--repo', repo,
+                '--body-file', '/tmp/layer1-comment.md',
+            ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(result.stderr); raise SystemExit(1)
+        print('Comment', 'updated' if existing and existing != 'null' else 'posted')
+        PYEOF

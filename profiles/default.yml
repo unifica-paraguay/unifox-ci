@@ -1,0 +1,19 @@
+# unifox-ci profile: default
+# Generic rules for any repository.
+
+name: default
+description: "Generic profile for any repository"
+
+guidelines:
+  - git_guidelines.rst   # Commit format [TAG] module: description
+
+branch_pattern: ".*"
+branch_hint: "No specific branch naming convention enforced"
+
+module_manifest: null    # no Odoo modules
+module_prefix: null
+
+version_format: null     # no version bump logic
+
+linters:
+  - flake8

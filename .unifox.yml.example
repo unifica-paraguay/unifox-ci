@@ -1,0 +1,20 @@
+# unifox-ci configuration
+# Copy this file to .unifox.yml in the root of your repository and adjust as needed.
+
+# Profile determines which rules and guidelines are applied.
+# Available profiles: odoo, default
+profile: odoo
+
+# Default base branch of this repository (used for diffs and version checks)
+base_branch: "19.0"
+
+# Odoo-specific settings (only relevant when profile = odoo)
+odoo:
+  version: "19"
+  addons_path: "."    # relative path where Odoo modules live (. = repo root)
+
+# Guidelines loaded into Claude's context on every call.
+# Remove entries you don't want enforced.
+standards:
+  - odoo-coding-guidelines   # Python, XML, JS, SCSS conventions
+  - odoo-git-guidelines      # Commit format [TAG] module: description
