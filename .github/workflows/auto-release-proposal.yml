@@ -42,6 +42,9 @@ jobs:
     steps:
       - name: Generate bot token
         id: bot-token
+        # continue-on-error is intentional: repos without the App installed
+        # fall back to github.token (github-actions[bot]). The next step
+        # logs a visible warning so operators are aware of the fallback.
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
@@ -110,7 +113,11 @@ jobs:
           if comments_r.returncode != 0:
               print(f"Failed to fetch comments: {comments_r.stderr.strip()}")
               sys.exit(1)
-          comments = json.loads(comments_r.stdout or '[]')
+          try:
+              comments = json.loads(comments_r.stdout or '[]')
+          except json.JSONDecodeError as e:
+              print(f"Failed to parse comments response: {e}")
+              sys.exit(1)
           proposal = next(
               (c for c in comments if '<!-- unifox-release-proposal -->' in c.get('body', '')),
               None,

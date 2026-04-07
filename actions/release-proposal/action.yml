@@ -272,7 +272,11 @@ runs:
             print(f"Warning: could not fetch associated PRs: {pr_r.stderr.strip()}")
             prs = []
         else:
-            prs = json.loads(pr_r.stdout or '[]')
+            try:
+                prs = json.loads(pr_r.stdout or '[]')
+            except json.JSONDecodeError as e:
+                print(f"Warning: could not parse PR list response: {e}")
+                prs = []
         pr_number = str(prs[0]['number']) if prs else ''
         print(f'Associated PR: #{pr_number}' if pr_number else 'No associated PR found')
 
