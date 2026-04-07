@@ -604,7 +604,7 @@ runs:
                 print(f'Auto-resolved thread for comment {cid}')
                 gh(
                     f'repos/{repo}/pulls/comments/{cid}/replies',
-                    body={'body': '\u2705 Resolved \u2014 not present in the latest diff.'},
+                    body={'body': '\u2705 Addressed \u2014 closing thread.'},
                     method='POST',
                 )
             else:
