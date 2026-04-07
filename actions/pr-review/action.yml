@@ -557,7 +557,7 @@ runs:
         base_checks = [
             "A. **YAML workflows** (critical): hardcoded secrets in workflow files; secrets or env vars exposed to untrusted contexts; (warning): permissions not minimised per job; secret names not matching org standard",
             "B. **Docker / docker-compose** (critical): hardcoded credentials in images or compose files; (warning): unnecessary volume mounts; deprecated syntax",
-            "C. **Shell scripts** (critical): missing 'set -euo pipefail' — silent failures in CI scripts are dangerous; unquoted variables that expand unexpectedly; (warning): non-idiomatic patterns",
+            "C. **Shell scripts** (critical): missing 'set -euo pipefail' — silent failures in CI scripts are dangerous; unquoted variables that expand unexpectedly; CI steps that call 'exit 1' without first printing a human-readable explanation of what failed and why — a bare 'Process completed with exit code 1' forces engineers to open logs and is not acceptable in production CI; (warning): non-idiomatic patterns",
             "D. **Config files** (warning): required fields missing; values inconsistent with repo structure",
         ]
         checklist = CHECKLISTS.get(profile, [
@@ -665,7 +665,7 @@ runs:
             "  \u2022 Correctness: logic bugs, wrong API usage, broken API contracts, resource leaks, unhandled exceptions at runtime",
             "  \u2022 Data handling: manual string-based encoding/escaping that silently corrupts certain inputs (e.g. str.replace instead of urllib.parse.quote); incorrect serialisation/deserialisation",
             "  \u2022 Tests: broken or vacuous assertions that always pass or always fail regardless of the implementation; incorrect return-value unpacking (e.g. comparing a tuple to a list); tests that do not actually exercise the intended behaviour",
-            "  \u2022 CI/CD: missing 'set -euo pipefail' in shell scripts; hardcoded secrets in workflow files",
+            "  \u2022 CI/CD: missing 'set -euo pipefail' in shell scripts; hardcoded secrets in workflow files; CI steps that exit with a bare 'exit 1' or 'Process completed with exit code N' without printing which specific check failed or why — engineers must not need to open logs to understand what broke",
             "  \u2022 Any violation of the critical items in the review checklist above",
             "- **warning** \u2192 important but not blocking; included in the PR summary.",
             "  Use for: missing test coverage on new logic, performance concerns, incomplete docs,",
