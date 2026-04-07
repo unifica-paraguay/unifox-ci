@@ -21,6 +21,7 @@ The fox is the spirit of Unifica: quick, precise, and always watching your PRs.
 | **PR Static Checks** | Branch naming, version bump, manifest & structure, test existence, flake8 |
 | **Odoo Tests Layer 1** | Runs test suite for modified modules only (fast, blocks merge) |
 | **Odoo Tests Layer 2** | Runs test suite for native Odoo dependencies of modified modules (regression, blocks merge) |
+| **Odoo Tests Layer 3** | Full nightly suite across all modules, no tag filter — opens a GitHub issue on failure |
 | **Release Prepare** | Generates AI changelog, creates git tag, publishes GitHub Release |
 
 ---
@@ -107,24 +108,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@main
+      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
-          base_branch: "19.0"
+          base_branch: ${{ github.base_ref || 'main' }}
+          event_action: ${{ github.event.action }}
           profile: odoo
   ai-code-review:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: unifica-paraguay/unifox-ci/actions/pr-review@main
+      - uses: unifica-paraguay/unifox-ci/actions/pr-review@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
-          base_branch: "19.0"
+          base_branch: ${{ github.base_ref || 'main' }}
           profile: odoo
 ```
 
@@ -150,6 +152,7 @@ unifox-ci/
 │   ├── pr-static-checks/ Branch naming, manifest, tests, lint
 │   ├── odoo-tests-layer1/ Tests for modified modules
 │   ├── odoo-tests-layer2/ Tests for native Odoo dependencies
+│   ├── odoo-tests-layer3/ Full nightly suite, opens issue on failure
 │   └── release-prepare/  Changelog + GitHub Release
 ├── scripts/              Shared Python/bash scripts
 │   ├── claude_api.py     Claude API wrapper (reads CLAUDE.md + guidelines)
@@ -164,6 +167,34 @@ unifox-ci/
 │   ├── content_guidelines.rst
 │   └── rst_guidelines.rst
 └── profiles/             Profile definitions (odoo.yml, default.yml)
+```
+
+---
+
+## Versioning policy
+
+unifox-ci uses **floating major tags** — the same pattern as `actions/checkout@v4`.
+
+| Ref | Stability | Use for |
+|-----|-----------|---------|
+| `@v1` | ✅ Stable — always the latest `v1.x.x` | **Production** — use this in all consuming repos |
+| `@v1.0.0` | 🔒 Pinned — exact commit, never moves | Emergency pin when you need strict reproducibility |
+| `@main` | ⚠️ Unstable — may break at any push | Development and testing only |
+
+### Releasing a new version
+
+```bash
+# Patch/minor fix — update v1 tag to the new commit
+git tag v1.x.x          # create the immutable patch tag
+git tag -f v1           # move the floating major tag forward
+git push origin v1.x.x
+git push origin v1 --force
+
+# Breaking change — bump to v2
+git tag v2.0.0
+git tag v2
+git push origin v2.0.0 v2
+# Update consuming repos to use @v2
 ```
 
 ---

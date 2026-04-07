@@ -18,6 +18,10 @@ inputs:
     description: "Base branch of the repository"
     required: false
     default: "main"
+  event_action:
+    description: "GitHub event action (opened, synchronize, reopened). Used to gate reviewer assignment to first open only."
+    required: false
+    default: "synchronize"
   profile:
     description: "Repository profile (odoo, default)"
     required: false
@@ -184,7 +188,7 @@ runs:
     # Reviewer assignment — only runs when the PR is first opened
     - name: Detect modified modules (for reviewer assignment)
       id: detect
-      if: github.event.action == 'opened'
+      if: inputs.event_action == 'opened'
       shell: bash
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
@@ -195,7 +199,7 @@ runs:
 
     - name: Choose reviewers
       id: reviewers
-      if: github.event.action == 'opened'
+      if: inputs.event_action == 'opened'
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
@@ -231,7 +235,7 @@ runs:
         PYEOF
 
     - name: Request review
-      if: github.event.action == 'opened'
+      if: inputs.event_action == 'opened'
       shell: bash
       env:
         GH_TOKEN: ${{ steps.token.outputs.value }}
