@@ -989,9 +989,9 @@ runs:
             if c['id'] in replied_resolved_ids
         ]
 
-        _SEVER_PREFIX_RE = re.compile(
-            r'^[\U0001f534\U0001f7e1\U0001f7e2\u2714\ufe0f\U0001f4a1]\s*\*\*[^*]+\*\*[:\s]*',
-        )
+        # Strip bold word label (e.g. "**Critical:**", "**Warning**:") from old bodies,
+        # keeping the leading emoji icon. New bodies are already icon-only prefixed.
+        _SEVER_WORD_RE = re.compile(r'\*\*[^*]+\*\*\s*:?\s*')
 
         def prev_table(items):
             rows = ['| File | Issue |', '|------|-------|']
@@ -999,9 +999,9 @@ runs:
                 path = c.get('path', '')
                 line = c.get('line', '')
                 body = c.get('body', '')
-                # Strip the severity prefix (e.g. "🔴 **Critical:** ") added when posting
                 first_line = body.split('\n')[0]
-                first_line = _SEVER_PREFIX_RE.sub('', first_line).strip()
+                # Strip bold word label but keep leading emoji (e.g. "🔴 **Critical:** " → "🔴 ")
+                first_line = _SEVER_WORD_RE.sub('', first_line, count=1).strip()
                 # Truncate at word boundary
                 if len(first_line) > 100:
                     first_line = first_line[:100].rsplit(' ', 1)[0].rstrip('.,;') + '…'
@@ -1022,15 +1022,15 @@ runs:
         suggs     = data.get('suggestions', [])
 
         if criticals:
-            body_lines += ['', '\U0001f534 **Critical \u2014 must fix before merge**', findings_table(criticals)]
+            body_lines += ['', '\U0001f534 **Must fix before merge**', findings_table(criticals)]
         if warnings:
-            body_lines += ['', '\U0001f7e1 **Warnings**', findings_table(warnings)]
+            body_lines += ['', '\U0001f7e1', findings_table(warnings)]
         if pending_comments:
             body_lines += ['', '\u21a9\ufe0f **Still pending**', prev_table(pending_comments)]
         if suggs:
-            body_lines += ['', '\U0001f4a1 **Suggestions**', findings_table(suggs)]
+            body_lines += ['', '\U0001f4a1', findings_table(suggs)]
         if resolved_comments:
-            body_lines += ['', f'\u2714\ufe0f **{len(resolved_comments)} resolved in this push**']
+            body_lines += ['', f'\u2714\ufe0f **{len(resolved_comments)} resolved**']
             body_lines.append(prev_table(resolved_comments))
 
         rev_body = '\n'.join(body_lines) + override_note
@@ -1050,7 +1050,7 @@ runs:
                 continue
             if not (c.get('path') and isinstance(c.get('line'), int) and c.get('body')):
                 continue
-            body = f'\U0001f534 **Critical:** {c["body"]}'
+            body = f'\U0001f534 {c["body"]}'
             inline.append({'path': c['path'], 'line': c['line'], 'body': body, 'side': 'RIGHT'})
 
         payload = {'commit_id': sha, 'body': rev_body, 'event': event, 'comments': inline}
