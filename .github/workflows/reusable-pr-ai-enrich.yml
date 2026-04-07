@@ -36,6 +36,14 @@ on:
         description: "Block merge on critical security findings"
         type: boolean
         default: true
+      enable_version_bump:
+        description: "AI-driven Odoo module version bumping (Odoo profile only)"
+        type: boolean
+        default: false
+      enable_odoo_tests:
+        description: "Run Odoo tests: Layer 1 (modified modules) + Layer 2 (native deps)"
+        type: boolean
+        default: false
 
 jobs:
   # -------------------------------------------------------------------------
@@ -106,11 +114,69 @@ jobs:
           event_action: ${{ github.event.action }}
           profile: ${{ inputs.profile }}
 
+  version-bump:
+    name: Version bump (Odoo)
+    needs: pre-flight
+    if: ${{ inputs.enable_version_bump }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-version-bump@claude/improve-bot-testing-q5hXf
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+
+  odoo-tests-layer1:
+    name: Tests — Layer 1 (modified modules)
+    needs: pre-flight
+    if: ${{ inputs.enable_odoo_tests }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer1@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+
+  odoo-tests-layer2:
+    name: Tests — Layer 2 (native dependencies)
+    needs: [pre-flight, odoo-tests-layer1]
+    if: ${{ inputs.enable_odoo_tests && always() && needs.odoo-tests-layer1.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer2@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+
   ai-code-review:
     name: AI code review
-    # Waits for static-checks so the review verdict reflects pipeline health:
-    # if static checks failed, the review cannot approve the PR.
-    needs: [pre-flight, enrich-metadata, static-checks]
+    # Waits for static-checks and (optionally) Odoo tests so the review verdict
+    # reflects the full pipeline health before deciding to approve or block.
+    needs: [pre-flight, enrich-metadata, static-checks, odoo-tests-layer1, odoo-tests-layer2]
     if: always() && needs.pre-flight.result == 'success' && needs.enrich-metadata.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -126,7 +192,7 @@ jobs:
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           base_branch: ${{ github.base_ref }}
           profile: ${{ inputs.profile }}
-          static_checks_failed: ${{ needs.static-checks.result == 'failure' }}
+          static_checks_failed: ${{ needs.static-checks.result == 'failure' || needs.odoo-tests-layer1.result == 'failure' || needs.odoo-tests-layer2.result == 'failure' }}
 
   security-scan:
     name: Security scan

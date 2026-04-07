@@ -11,22 +11,60 @@ inputs:
   unifox_private_key:
     description: "unifox-ci GitHub App private key"
     required: true
+  profile:
+    description: "Repository profile"
+    required: false
+    default: "odoo"
 
 runs:
   using: "composite"
   steps:
+    - name: Load profile config
+      id: profile-cfg
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        python3 - <<'PYEOF'
+        import os
+        profile = os.environ.get('PROFILE', 'odoo')
+        path = os.path.join(os.environ['ACTION_PATH'], '../../profiles', f'{profile}.yml')
+        cfg = {}
+        try:
+            for line in open(path):
+                line = line.strip()
+                if line.startswith('#') or ':' not in line:
+                    continue
+                k, _, v = line.partition(':')
+                v = v.strip().strip('"').strip("'")
+                if v and v != 'null':
+                    cfg[k.strip()] = v
+        except FileNotFoundError:
+            pass
+        odoo_image = cfg.get('odoo_image', 'odoo:19')
+        module_prefix = cfg.get('module_prefix', 'unifica_')
+        print(f"Profile {profile}: odoo={odoo_image}, prefix={module_prefix}")
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"odoo_image={odoo_image}\n")
+            f.write(f"module_prefix={module_prefix}\n")
+        PYEOF
+
     - name: Discover all unifica_* modules
       id: modules
       shell: bash
+      env:
+        MODULE_PREFIX: ${{ steps.profile-cfg.outputs.module_prefix }}
       run: |
-        MODS=$(find . -maxdepth 1 -type d -name 'unifica_*' \
+        PREFIX="${MODULE_PREFIX:-unifica_}"
+        MODS=$(find . -maxdepth 1 -type d -name "${PREFIX}*" \
           | sed 's|^\./||' | sort | paste -sd ',')
         echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
         echo "All modules: $MODS"
 
     - name: Pull Odoo image
       shell: bash
-      run: docker pull odoo:19 || true
+      run: docker pull ${{ steps.profile-cfg.outputs.odoo_image }} || true
 
     - name: Start PostgreSQL
       shell: bash

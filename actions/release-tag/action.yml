@@ -33,6 +33,14 @@ inputs:
     required: false
     default: "true"
 
+outputs:
+  new_tag:
+    description: "The tag that was created (or would be created in dry-run)"
+    value: ${{ steps.publish.outputs.new_tag }}
+  release_url:
+    description: "URL of the published GitHub Release"
+    value: ${{ steps.publish.outputs.release_url }}
+
 runs:
   using: "composite"
   steps:
@@ -358,6 +366,7 @@ runs:
         PYEOF
 
     - name: Create GitHub Release
+      id: publish
       if: inputs.dry_run != 'true'
       shell: bash
       env:
@@ -411,7 +420,12 @@ runs:
             ['gh', 'release', 'view', new_tag, '--repo', repo, '--json', 'url', '--jq', '.url'],
             capture_output=True, text=True,
         )
-        print(f"Release URL: {url_result.stdout.strip()}")
+        release_url = url_result.stdout.strip()
+        print(f"Release URL: {release_url}")
+
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"new_tag={new_tag}\n")
+            f.write(f"release_url={release_url}\n")
         PYEOF
 
     - name: Post step summary

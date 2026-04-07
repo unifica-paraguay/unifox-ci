@@ -1,0 +1,109 @@
+name: "[Reusable] Release"
+
+# Odoo-style versioned release. Call this from your repo to publish a
+# new release with an AI-generated changelog and annotated git tag.
+#
+# Two modes:
+#   1. Manual dispatch (recommended for first use):
+#        on:
+#          workflow_dispatch:
+#            inputs:
+#              release_tag: { required: true, type: string }
+#              draft:       { default: 'true',  type: choice, options: ['true','false'] }
+#        jobs:
+#          release:
+#            uses: unifica-paraguay/unifox-ci/.github/workflows/reusable-release.yml@v1
+#            with:
+#              release_tag:   ${{ inputs.release_tag }}
+#              target_branch: ${{ github.ref_name }}
+#              draft:         ${{ inputs.draft == 'true' }}
+#            secrets: inherit
+#
+#   2. Automated (trigger on merge to release branch after human approval):
+#        on:
+#          push:
+#            branches: ['release/**', 'release-*']
+#        jobs:
+#          release:
+#            uses: unifica-paraguay/unifox-ci/.github/workflows/reusable-release.yml@v1
+#            with:
+#              release_tag:   "v19.0.X.Y.Z"   # compute before calling
+#              target_branch: ${{ github.ref_name }}
+#              draft:         false
+#            secrets: inherit
+#
+# Tag format: v19.0.X.Y.Z  (Odoo versioning — validated by release-prepare)
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag to create (e.g. v19.0.3.0.0)"
+        type: string
+        required: true
+      target_branch:
+        description: "Target branch for the GitHub Release"
+        type: string
+        default: "19.0"
+      draft:
+        description: "Create as draft release (publish manually afterwards)"
+        type: boolean
+        default: true
+    outputs:
+      release_url:
+        description: "URL of the created GitHub Release"
+        value: ${{ jobs.release.outputs.release_url }}
+      release_tag:
+        description: "Tag that was created"
+        value: ${{ jobs.release.outputs.release_tag }}
+
+jobs:
+  release:
+    name: Release ${{ inputs.release_tag }}
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: ${{ steps.prepare.outputs.release_url }}
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_url: ${{ steps.prepare.outputs.release_url }}
+      release_tag:  ${{ inputs.release_tag }}
+    steps:
+      - name: Generate bot token
+        id: bot-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          private-key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+
+      - name: Require app token
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -n "$BOT_TOKEN" ]; then
+            echo "Token: using GitHub App (unifox-ci[bot])"
+            exit 0
+          fi
+          ORG="${REPO%%/*}"
+          echo "::error title=unifox-ci not installed::Install unifox-ci at https://github.com/apps/unifox-ci or enable it at https://github.com/organizations/${ORG}/settings/installations"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.bot-token.outputs.token }}
+
+      - id: prepare
+        uses: unifica-paraguay/unifox-ci/actions/release-prepare@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          release_tag: ${{ inputs.release_tag }}
+          target_branch: ${{ inputs.target_branch }}
+          draft: ${{ inputs.draft }}

@@ -25,6 +25,14 @@ inputs:
     required: false
     default: "true"
 
+outputs:
+  release_url:
+    description: "URL of the created or updated GitHub Release"
+    value: ${{ steps.publish.outputs.release_url }}
+  release_tag:
+    description: "Tag that was created"
+    value: ${{ inputs.release_tag }}
+
 runs:
   using: "composite"
   steps:
@@ -232,6 +240,7 @@ runs:
         fi
 
     - name: Create GitHub Release
+      id: publish
       shell: bash
       env:
         GH_TOKEN: ${{ steps.token.outputs.value }}
@@ -254,9 +263,9 @@ runs:
             $DRAFT_FLAG
         fi
 
-        echo ""
-        echo "Release URL:"
-        gh release view "$TAG" --repo "$REPO" --json url --jq '.url'
+        RELEASE_URL=$(gh release view "$TAG" --repo "$REPO" --json url --jq '.url')
+        echo "Release URL: $RELEASE_URL"
+        echo "release_url=${RELEASE_URL}" >> "$GITHUB_OUTPUT"
 
     - name: Post summary
       shell: bash
