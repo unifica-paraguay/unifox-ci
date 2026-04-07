@@ -732,7 +732,8 @@ runs:
         python3 - <<'PYEOF'
         import json, sys
         try:
-            verdict = json.load(open('/tmp/review_parsed.json')).get('verdict', 'COMMENT')
+            with open('/tmp/review_parsed.json') as f:
+                verdict = json.load(f).get('verdict', 'COMMENT')
         except FileNotFoundError:
             sys.exit(0)
         if verdict == 'CHANGES_REQUESTED':
