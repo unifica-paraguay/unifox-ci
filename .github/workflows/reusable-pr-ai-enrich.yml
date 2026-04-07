@@ -28,6 +28,10 @@ on:
         description: "Auto-assign PR labels"
         type: boolean
         default: true
+      enable_static_checks:
+        description: "Run static checks (commit messages, branch naming, lint, tests)"
+        type: boolean
+        default: true
       fail_on_security_critical:
         description: "Block merge on critical security findings"
         type: boolean
@@ -139,6 +143,26 @@ jobs:
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           base_branch: ${{ github.base_ref }}
           fail_on_critical: ${{ inputs.fail_on_security_critical }}
+
+  static-checks:
+    name: Static checks
+    needs: pre-flight
+    if: ${{ inputs.enable_static_checks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-static-checks@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
 
   auto-labels:
     name: Auto-assign labels
