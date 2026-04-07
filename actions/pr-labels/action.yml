@@ -48,7 +48,22 @@ runs:
 
     - name: Install dependencies
       shell: bash
-      run: pip install requests -q
+      run: python3 -m pip install requests -q
+
+    - name: Diagnostics
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        echo "Python: $(python3 --version)"
+        echo "pip:    $(python3 -m pip --version)"
+        echo "REPO:   ${REPO}"
+        echo "PR:     ${PR_NUMBER}"
+        echo "Token:  $([ -n "$GH_TOKEN" ] && echo 'set' || echo 'EMPTY')"
+        python3 -c "import requests; print('requests:', requests.__version__)"
+        gh auth status 2>&1 | head -3 || true
 
     - name: Pass 1 — deterministic labels (size + type)
       id: deterministic
@@ -342,7 +357,7 @@ runs:
         # Call Claude
         scripts_dir = os.environ['SCRIPTS_DIR']
         r = subprocess.run(
-            ['python', f'{scripts_dir}/claude_api.py', prompt],
+            ['python3', f'{scripts_dir}/claude_api.py', prompt],
             capture_output=True, text=True,
             env={**os.environ, 'UNIFOX_PROFILE': 'default'},
         )
