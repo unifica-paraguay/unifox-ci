@@ -169,43 +169,49 @@ runs:
             float_tag_example = "v1"
             latest_example    = "latest"
 
-        prompt = f"""You are a versioning assistant for a software system. Analyze these \
-commits and determine the correct semantic version bump for the SYSTEM as a whole \
-(not individual modules).
-
-Tag style: {tag_prefix}
-Current system version: {current_version}
-{branch_context}
-Commits since last system release (format: SHA|subject|author|date):
-{commits_raw}
-
-Bump rules:
-- patch (Z): bug fixes, docs, CI changes, minor improvements
-- minor (Y): new features, new modules, significant improvements
-- major (X): breaking changes, major architectural changes, dropping support for something
-
-For odoo style, only bump the semver segment (X.Y.Z) of {odoo_ver}-vX.Y.Z if tag_prefix is odoo.
-The branch prefix ({odoo_ver}) never changes — it identifies the Odoo major release line.
-If this is the first release, start from v0.1.0 for minor features or v1.0.0 for a stable release.
-
-Output ONLY a valid JSON object:
-{{
-  "new_tag": "{new_tag_example}",
-  "bump_type": "patch|minor|major",
-  "floating_tag": "{float_tag_example}",
-  "latest_tag": "{latest_example}",
-  "reasoning": "one line explanation",
-  "changelog_sections": {{
-    "New features": [],
-    "Improvements": [],
-    "Bug fixes": [],
-    "Infrastructure/CI": [],
-    "Other": []
-  }},
-  "release_summary": "2-3 sentence summary of this system release"
-}}
-Omit empty arrays from changelog_sections but keep the key structure.
-No markdown fences, no explanation outside the JSON."""
+        prompt_parts = [
+            'You are a versioning assistant for a software system. Analyze these '
+            'commits and determine the correct semantic version bump for the SYSTEM '
+            'as a whole (not individual modules).',
+            '',
+            f'Tag style: {tag_prefix}',
+            f'Current system version: {current_version}',
+        ]
+        if branch_context:
+            prompt_parts.append(branch_context.rstrip())
+        prompt_parts += [
+            'Commits since last system release (format: SHA|subject|author|date):',
+            commits_raw,
+            '',
+            'Bump rules:',
+            '- patch (Z): bug fixes, docs, CI changes, minor improvements',
+            '- minor (Y): new features, new modules, significant improvements',
+            '- major (X): breaking changes, major architectural changes, dropping support for something',
+            '',
+            f'For odoo style, only bump the semver segment (X.Y.Z) of {odoo_ver}-vX.Y.Z if tag_prefix is odoo.',
+            f'The branch prefix ({odoo_ver}) never changes — it identifies the Odoo major release line.',
+            'If this is the first release, start from v0.1.0 for minor features or v1.0.0 for a stable release.',
+            '',
+            'Output ONLY a valid JSON object:',
+            '{',
+            f'  "new_tag": "{new_tag_example}",',
+            '  "bump_type": "patch|minor|major",',
+            f'  "floating_tag": "{float_tag_example}",',
+            f'  "latest_tag": "{latest_example}",',
+            '  "reasoning": "one line explanation",',
+            '  "changelog_sections": {',
+            '    "New features": [],',
+            '    "Improvements": [],',
+            '    "Bug fixes": [],',
+            '    "Infrastructure/CI": [],',
+            '    "Other": []',
+            '  },',
+            '  "release_summary": "2-3 sentence summary of this system release"',
+            '}',
+            'Omit empty arrays from changelog_sections but keep the key structure.',
+            'No markdown fences, no explanation outside the JSON.',
+        ]
+        prompt = '\n'.join(prompt_parts)
 
         result = subprocess.run(
             ['python', f'{scripts_dir}/claude_api.py', prompt],
