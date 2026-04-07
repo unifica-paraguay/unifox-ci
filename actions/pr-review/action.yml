@@ -805,7 +805,7 @@ runs:
         STATIC_CHECKS_FAILED: ${{ inputs.static_checks_failed }}
       run: |
         python3 - <<'PYEOF'
-        import json, os, subprocess, sys
+        import json, os, re, subprocess, sys
 
         ctx  = json.load(open('/tmp/review_context.json'))
         data = json.load(open('/tmp/review_parsed.json'))
@@ -989,15 +989,24 @@ runs:
             if c['id'] in replied_resolved_ids
         ]
 
+        _SEVER_PREFIX_RE = re.compile(
+            r'^[\U0001f534\U0001f7e1\U0001f7e2\u2714\ufe0f\U0001f4a1]\s*\*\*[^*]+\*\*[:\s]*',
+        )
+
         def prev_table(items):
             rows = ['| File | Issue |', '|------|-------|']
             for c in items:
                 path = c.get('path', '')
                 line = c.get('line', '')
                 body = c.get('body', '')
-                title = body.split('\n')[0][:70].rstrip()
+                # Strip the severity prefix (e.g. "🔴 **Critical:** ") added when posting
+                first_line = body.split('\n')[0]
+                first_line = _SEVER_PREFIX_RE.sub('', first_line).strip()
+                # Truncate at word boundary
+                if len(first_line) > 100:
+                    first_line = first_line[:100].rsplit(' ', 1)[0].rstrip('.,;') + '…'
                 loc   = f'`{path}:{line}`' if path and line else (f'`{path}`' if path else '—')
-                rows.append(f'| {loc} | {title} |')
+                rows.append(f'| {loc} | {first_line} |')
             return '\n'.join(rows)
 
         # ── Assemble body sections ────────────────────────────────────────────
