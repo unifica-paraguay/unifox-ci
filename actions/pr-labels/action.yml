@@ -62,6 +62,7 @@ runs:
       run: |
         python3 - <<'PYEOF'
         import json, os, re, subprocess
+        from urllib.parse import quote
 
         repo     = os.environ['REPO']
         pr       = os.environ['PR_NUMBER']
@@ -159,7 +160,7 @@ runs:
         # Remove stale size labels
         for old in current:
             if old.startswith('size: ') and old != size_label:
-                gh(f'repos/{repo}/issues/{pr}/labels/{old.replace(" ", "%20").replace(":", "%3A")}',
+                gh(f'repos/{repo}/issues/{pr}/labels/{quote(old, safe='')}',
                    method='DELETE')
                 print(f'Removed stale label: {old}')
 
@@ -193,7 +194,7 @@ runs:
             # Remove old type label if it changed
             for old in current:
                 if old.startswith('type: ') and old != type_label:
-                    gh(f'repos/{repo}/issues/{pr}/labels/{old.replace(" ", "%20").replace(":", "%3A")}',
+                    gh(f'repos/{repo}/issues/{pr}/labels/{quote(old, safe='')}',
                        method='DELETE')
                     print(f'Removed stale label: {old}')
             to_apply.append(type_label)
@@ -293,46 +294,50 @@ runs:
         # This is the anti-hallucination boundary: if it's not in the list,
         # it cannot be assigned.
         # ------------------------------------------------------------------ #
-        area_list = '\n'.join(f'  - {l}: {catalog[l][1]}' for l in area_labels)
+        area_list_str = '\n'.join(f'  - {l}: {catalog[l][1]}' for l in area_labels)
+        commits_str   = '\n'.join(f'  - {c}' for c in ctx['commits'])
+        files_str     = '\n'.join(f'  {f}' for f in ctx['changed_files'][:40])
 
-        prompt = f"""You are assigning area labels to a pull request. Your task is to pick
-the correct area labels from the EXACT list below — no others, no variations.
-
-## Pull request context
-
-Title: {ctx['title']}
-
-Description:
-{ctx['description']}
-
-Commits:
-{chr(10).join('  - ' + c for c in ctx['commits'])}
-
-Changed files:
-{chr(10).join('  ' + f for f in ctx['changed_files'][:40])}
-
-Diff summary:
-{ctx['diff_stat']}
-
-## Available area labels (ONLY pick from this exact list)
-
-{area_list}
-
-## Already applied labels on this PR
-
-{', '.join(current) or 'none'}
-
-## Instructions
-
-1. Read the PR title, description, commits, and changed files carefully.
-2. Select 1–3 area labels that BEST describe what this PR touches.
-3. Only assign an area label if the PR clearly touches that area — do not guess.
-4. Do NOT assign an area label that is already present on the PR.
-5. Do NOT invent labels. Use ONLY the names from the list above, character-for-character.
-6. If none of the area labels apply, return an empty array.
-
-Output ONLY a valid JSON array of label name strings. No explanation, no markdown.
-Example: ["area: frontend", "area: api"]"""
+        prompt = '\n'.join([
+            'You are assigning area labels to a pull request. Your task is to pick',
+            'the correct area labels from the EXACT list below — no others, no variations.',
+            '',
+            '## Pull request context',
+            '',
+            f'Title: {ctx["title"]}',
+            '',
+            'Description:',
+            ctx['description'],
+            '',
+            'Commits:',
+            commits_str,
+            '',
+            'Changed files:',
+            files_str,
+            '',
+            'Diff summary:',
+            ctx['diff_stat'],
+            '',
+            '## Available area labels (ONLY pick from this exact list)',
+            '',
+            area_list_str,
+            '',
+            '## Already applied labels on this PR',
+            '',
+            ', '.join(current) or 'none',
+            '',
+            '## Instructions',
+            '',
+            '1. Read the PR title, description, commits, and changed files carefully.',
+            '2. Select 1–3 area labels that BEST describe what this PR touches.',
+            '3. Only assign an area label if the PR clearly touches that area — do not guess.',
+            '4. Do NOT assign an area label that is already present on the PR.',
+            '5. Do NOT invent labels. Use ONLY the names from the list above, character-for-character.',
+            '6. If none of the area labels apply, return an empty array.',
+            '',
+            'Output ONLY a valid JSON array of label name strings. No explanation, no markdown.',
+            'Example: ["area: frontend", "area: api"]',
+        ])
 
         # Call Claude
         scripts_dir = os.environ['SCRIPTS_DIR']

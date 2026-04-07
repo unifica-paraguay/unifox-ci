@@ -43,6 +43,15 @@ TIMEOUT = 90  # increased for large context prompts
 # ---------------------------------------------------------------------------
 
 
+def _append_git_guidelines(parts: list, context_dir: "Path") -> None:
+    git_gl = context_dir / "git_guidelines.rst"
+    if git_gl.exists():
+        parts.append(
+            "\n=== Git / commit guidelines ===\n\n"
+            + git_gl.read_text(encoding="utf-8")
+        )
+
+
 def _load_system_prompt() -> str:
     # scripts/ lives one level below the unifox-ci repo root
     unifox_root = Path(__file__).resolve().parent.parent
@@ -71,12 +80,7 @@ def _load_system_prompt() -> str:
                 "\n=== Odoo coding guidelines ===\n\n"
                 + coding.read_text(encoding="utf-8")
             )
-        git_gl = context_dir / "git_guidelines.rst"
-        if git_gl.exists():
-            parts.append(
-                "\n=== Git / commit guidelines ===\n\n"
-                + git_gl.read_text(encoding="utf-8")
-            )
+        _append_git_guidelines(parts, context_dir)
         # Optional doc guidelines
         if os.environ.get("UNIFOX_LOAD_DOC_GUIDELINES") == "1":
             for fname in ("content_guidelines.rst", "rst_guidelines.rst"):
@@ -95,30 +99,15 @@ def _load_system_prompt() -> str:
                 "\n=== JavaScript / TypeScript / React guidelines ===\n\n"
                 + js_gl.read_text(encoding="utf-8")
             )
-        git_gl = context_dir / "git_guidelines.rst"
-        if git_gl.exists():
-            parts.append(
-                "\n=== Git / commit guidelines ===\n\n"
-                + git_gl.read_text(encoding="utf-8")
-            )
+        _append_git_guidelines(parts, context_dir)
 
     # Python non-Odoo: just git guidelines (Python best practices are in the prompt)
     elif profile == "python":
-        git_gl = context_dir / "git_guidelines.rst"
-        if git_gl.exists():
-            parts.append(
-                "\n=== Git / commit guidelines ===\n\n"
-                + git_gl.read_text(encoding="utf-8")
-            )
+        _append_git_guidelines(parts, context_dir)
 
     # Default / unknown: git guidelines only
     else:
-        git_gl = context_dir / "git_guidelines.rst"
-        if git_gl.exists():
-            parts.append(
-                "\n=== Git / commit guidelines ===\n\n"
-                + git_gl.read_text(encoding="utf-8")
-            )
+        _append_git_guidelines(parts, context_dir)
 
     return "\n\n".join(parts)
 

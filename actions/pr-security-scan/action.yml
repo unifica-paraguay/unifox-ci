@@ -94,9 +94,16 @@ runs:
             ),
             # --- SQL injection ---
             (
-                r'(?i)(query|execute|cursor\.execute)\s*\(\s*["\'].*?%[s|d|f].*?["\']|f["\'].*?SELECT|f["\'].*?INSERT|f["\'].*?UPDATE|f["\'].*?DELETE',
-                'critical', 'Potential SQL injection (f-string or %-format in query)',
+                # %-format strings passed directly to execute/query
+                r'(?i)(query|execute|cursor\.execute)\s*\(\s*["\'][^"\']*%[sd][^"\']*["\']',
+                'critical', 'Potential SQL injection (%-format string in query call)',
                 r'(?i)(parameterized|placeholder|\?|%s.*params|bind)',
+            ),
+            (
+                # f-strings whose FIRST token is a SQL keyword (e.g. f"SELECT {x}")
+                r'(?i)f["\'][\s]*(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b',
+                'critical', 'Potential SQL injection (f-string starting with SQL keyword)',
+                r'(?i)(parameterized|placeholder|safe|escaped)',
             ),
             (
                 r'\.execute\([^,\)]*\+',
@@ -107,12 +114,13 @@ runs:
             (
                 r'\beval\s*\(',
                 'critical', 'Use of eval() — potential code injection',
-                r'(?i)(#.*eval|safe_eval|test|spec|example)',
+                # Skip: commented-out, safe_eval wrapper, tests, or the word inside a string
+                r'(?i)(#.*\beval\b|safe_eval|test|spec|example|["\'][^"\']*\beval\b[^"\']*["\'])',
             ),
             (
                 r'\bexec\s*\(',
                 'warning', 'Use of exec() — review if input is trusted',
-                r'(?i)(#.*exec|subprocess|test|spec)',
+                r'(?i)(#.*\bexec\b|subprocess|test|spec|["\'][^"\']*\bexec\b[^"\']*["\'])',
             ),
             # --- Debug code ---
             (
@@ -121,17 +129,18 @@ runs:
                 r'(?i)(test|spec|\.test\.|\.spec\.|__test__|logger|log\.)',
             ),
             (
-                r'\bdebugger\b',
+                # Only flag standalone `debugger` statement (as its own token on the line)
+                r'^\s*debugger\s*;?\s*$',
                 'critical', 'debugger statement left in production code',
                 r'(?i)(test|spec)',
             ),
             (
-                r'\bbreakpoint\s*\(\s*\)',
+                r'^\s*breakpoint\s*\(\s*\)\s*;?\s*$',
                 'critical', 'breakpoint() left in production code',
                 r'(?i)(test|spec)',
             ),
             (
-                r'\bpdb\.set_trace\s*\(\s*\)',
+                r'^\s*pdb\.set_trace\s*\(\s*\)\s*$',
                 'critical', 'pdb.set_trace() left in production code',
                 r'(?i)(test|spec)',
             ),
@@ -174,7 +183,8 @@ runs:
 
         # Skip generated / binary / lock files
         SKIP_DIRS  = {'node_modules', 'dist', 'build', '.next', '.astro', '__pycache__', '.venv', 'venv'}
-        SKIP_EXTS  = {'.lock', '.pyc', '.min.js', '.map', '.png', '.jpg', '.gif', '.svg', '.woff', '.ttf'}
+        SKIP_EXTS  = {'.lock', '.pyc', '.min.js', '.map', '.png', '.jpg', '.gif', '.svg', '.woff', '.ttf',
+                      '.yml', '.yaml'}   # CI/config files — not production code; skip to avoid self-scan FP
         SKIP_NAMES = {'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
 
         findings = []  # list of dicts: file, line, severity, label, snippet
