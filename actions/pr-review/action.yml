@@ -737,7 +737,9 @@ runs:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
                 print(f"Warning: could not parse response ({e}) — safe fallback")
-                data = {'verdict': 'COMMENT', 'summary': 'Review parse error.', 'new_comments': [], 'reply_to': []}
+                # _is_parse_error=True tells downstream code to skip auto-resolve so
+                # pending threads are NOT silently closed when Claude returned garbage.
+                data = {'verdict': 'COMMENT', 'summary': 'Review parse error.', 'new_comments': [], 'reply_to': [], '_is_parse_error': True}
 
         if 'veredicto' in data and 'verdict' not in data:
             data['verdict'] = data.pop('veredicto')
@@ -844,45 +846,50 @@ runs:
         # Auto-resolve: pending threads not explicitly carried forward as still-pending.
         # Claude is instructed to generate reply_to for every pending comment, but as a
         # safety net we resolve any it silently omitted (avoids comment accumulation).
-        explicitly_still_pending = {
-            r['comment_id'] for r in data.get('reply_to', [])
-            if not r.get('resolved', True)
-        }
-        already_replied_resolved = {
-            r['comment_id'] for r in data.get('reply_to', [])
-            if r.get('resolved') and 'comment_id' in r
-        }
+        # EXCEPTION: on parse error skip auto-resolve entirely — empty reply_to is not
+        # Claude's intent; it means the response was unreadable, so leave threads alone.
         auto_resolved = 0
-        for comment in prev:
-            cid = comment['id']
-            if comment['is_resolved'] or cid in explicitly_still_pending:
-                continue
-            if cid in already_replied_resolved:
-                continue  # already handled in the reply_to loop above
-            tid = c2t.get(cid, {}).get('thread_id')
-            if not tid:
-                print(f'Warning: no thread_id mapping for comment {cid} — cannot auto-resolve')
-                continue
-            # Resolve the thread first; only post the reply if resolution succeeds.
-            # This avoids a dangling reply comment when the GraphQL call fails.
-            gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
-                   '{thread{id isResolved}}}')
-            gql_r = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
-                capture_output=True, text=True,
-            )
-            if gql_r.returncode == 0:
-                auto_resolved += 1
-                print(f'Auto-resolved thread for comment {cid}')
-                gh(
-                    f'repos/{repo}/pulls/comments/{cid}/replies',
-                    body={'body': '\u2705 Addressed \u2014 closing thread.'},
-                    method='POST',
+        if data.get('_is_parse_error'):
+            print('Parse error detected — skipping auto-resolve to preserve pending threads')
+        else:
+            explicitly_still_pending = {
+                r['comment_id'] for r in data.get('reply_to', [])
+                if not r.get('resolved', True)
+            }
+            already_replied_resolved = {
+                r['comment_id'] for r in data.get('reply_to', [])
+                if r.get('resolved') and 'comment_id' in r
+            }
+            for comment in prev:
+                cid = comment['id']
+                if comment['is_resolved'] or cid in explicitly_still_pending:
+                    continue
+                if cid in already_replied_resolved:
+                    continue  # already handled in the reply_to loop above
+                tid = c2t.get(cid, {}).get('thread_id')
+                if not tid:
+                    print(f'Warning: no thread_id mapping for comment {cid} — cannot auto-resolve')
+                    continue
+                # Resolve the thread first; only post the reply if resolution succeeds.
+                # This avoids a dangling reply comment when the GraphQL call fails.
+                gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
+                       '{thread{id isResolved}}}')
+                gql_r = subprocess.run(
+                    ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
+                    capture_output=True, text=True,
                 )
-            else:
-                print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
-        if auto_resolved:
-            print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
+                if gql_r.returncode == 0:
+                    auto_resolved += 1
+                    print(f'Auto-resolved thread for comment {cid}')
+                    gh(
+                        f'repos/{repo}/pulls/comments/{cid}/replies',
+                        body={'body': '\u2705 Addressed \u2014 closing thread.'},
+                        method='POST',
+                    )
+                else:
+                    print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
+            if auto_resolved:
+                print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
 
         # Only count as "newly done" comments that were actually pending before this review.
         # Avoids double-counting threads that were resolved externally (e.g. via GraphQL)
