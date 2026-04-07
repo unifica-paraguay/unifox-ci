@@ -580,12 +580,15 @@ runs:
             r['comment_id'] for r in data.get('reply_to', [])
             if not r.get('resolved', True)
         }
+        already_replied_resolved = {
+            r.get('comment_id') for r in data.get('reply_to', []) if r.get('resolved')
+        }
         auto_resolved = 0
         for comment in prev:
             cid = comment['id']
             if comment['is_resolved'] or cid in explicitly_still_pending:
                 continue
-            if cid in {r.get('comment_id') for r in data.get('reply_to', []) if r.get('resolved')}:
+            if cid in already_replied_resolved:
                 continue  # already handled in the reply_to loop above
             tid = c2t.get(cid, {}).get('thread_id')
             if not tid:

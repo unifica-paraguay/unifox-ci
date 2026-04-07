@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: release
-      url: https://github.com/unifica-paraguay/unifox-ci/releases/tag/${{ needs.propose.outputs.proposed_tag }}
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.propose.outputs.proposed_tag }}
     permissions:
       contents: write
       pull-requests: write
