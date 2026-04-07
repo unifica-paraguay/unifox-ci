@@ -27,8 +27,46 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Verify the unifox-ci App token exactly once before running the parallel jobs.
+  # This prevents both enrich-metadata and ai-code-review from each posting the
+  # same "not installed" comment when the App is absent.
+  pre-flight:
+    name: Verify App token
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate app token
+        id: gen-token
+        # continue-on-error is intentional: the following step needs to run when
+        # token generation fails so it can post the install instructions and exit 1.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          private-key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+
+      - name: Require app token
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -n "$APP_TOKEN" ]; then
+            echo "Token: using GitHub App (unifox-ci[bot])"
+            exit 0
+          fi
+          ORG="${REPO%%/*}"
+          INSTALL_URL="https://github.com/apps/unifox-ci"
+          SETTINGS_URL="https://github.com/organizations/${ORG}/settings/installations"
+          MSG=$(printf '## ⚠️ unifox-ci not installed\n\nThis workflow requires the **unifox-ci** GitHub App. Without it, CI cannot post review comments or enrichments on this repository.\n\n**To fix:** [Install unifox-ci →](%s)\nOr enable it for this repo in your [organization app settings](%s).\n\nOnce installed, re-run this workflow.' "$INSTALL_URL" "$SETTINGS_URL")
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$MSG" || true
+          echo "ERROR: unifox-ci GitHub App is not installed — install it to unblock CI."
+          exit 1
+
   enrich-metadata:
     name: Update title & description
+    needs: pre-flight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +83,7 @@ jobs:
 
   ai-code-review:
     name: AI code review
+    needs: pre-flight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
