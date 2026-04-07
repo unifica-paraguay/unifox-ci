@@ -486,8 +486,13 @@ runs:
                 print(f'Warning: could not dismiss review {rid}')
 
         prev        = ctx.get('prev_comments', [])
-        was_pending = sum(1 for c in prev if not c['is_resolved'])
-        newly_done  = sum(1 for re in data.get('reply_to', []) if re.get('resolved'))
+        pending_ids = {c['id'] for c in prev if not c['is_resolved']}
+        was_pending = len(pending_ids)
+        # Only count as "newly done" comments that were actually pending before this review.
+        # Avoids double-counting threads that were resolved externally (e.g. via GraphQL)
+        # before the review ran — those are already in the already-resolved count.
+        newly_done  = sum(1 for re in data.get('reply_to', [])
+                          if re.get('resolved') and re.get('comment_id') in pending_ids)
         now_pending = max(0, was_pending - newly_done)
         now_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done
         new_count   = len([c for c in data.get('new_comments', [])
