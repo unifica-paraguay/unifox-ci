@@ -1,0 +1,203 @@
+name: "unifox-ci: Odoo Tests — Layer 3 (full nightly suite)"
+description: >
+  Runs the complete test suite across all unifica_* modules with no
+  --test-tags filter. Intended for nightly scheduled runs on the main
+  branch. On failure, opens a GitHub issue.
+
+inputs:
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Discover all unifica_* modules
+      id: modules
+      shell: bash
+      run: |
+        MODS=$(find . -maxdepth 1 -type d -name 'unifica_*' \
+          | sed 's|^\./||' | sort | paste -sd ',')
+        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        echo "All modules: $MODS"
+
+    - name: Pull Odoo image
+      shell: bash
+      run: docker pull odoo:19 || true
+
+    - name: Start PostgreSQL
+      shell: bash
+      run: |
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" up -d db
+
+    - name: Wait for PostgreSQL
+      shell: bash
+      run: |
+        for i in $(seq 1 24); do
+          docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+            exec -T db pg_isready -U odoo && break
+          echo "  attempt $i/24 — sleeping 5s..."
+          sleep 5
+        done
+
+    - name: Run full test suite
+      id: odoo-run
+      shell: bash
+      env:
+        REPO_ROOT: ${{ github.workspace }}
+        MODULES: ${{ steps.modules.outputs.modules }}
+      run: |
+        echo "Running full suite for: $MODULES"
+
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+          run --rm \
+          -e REPO_ROOT="${REPO_ROOT}" \
+          odoo \
+          odoo \
+            -d test_db \
+            --db_host db \
+            --db_user odoo \
+            --db_password odoo \
+            --test-enable \
+            --stop-after-init \
+            -i "$MODULES" \
+          2>&1 | tee /tmp/nightly-output.txt
+
+        if grep -qE "^(FAIL|ERROR):" /tmp/nightly-output.txt; then
+          echo "failures=true" >> "$GITHUB_OUTPUT"
+          echo "::error::Test failures detected in nightly run."
+          exit 1
+        fi
+
+        echo "failures=false" >> "$GITHUB_OUTPUT"
+
+    - name: Tear down Docker services
+      if: always()
+      shell: bash
+      run: |
+        docker compose -f "${{ github.action_path }}/../../docker/docker-compose.yml" \
+          down -v --remove-orphans || true
+
+    - name: Extract failed modules from output
+      if: failure()
+      shell: bash
+      run: |
+        python3 - <<'PYEOF'
+        import re
+
+        try:
+            output = open('/tmp/nightly-output.txt').read()
+        except FileNotFoundError:
+            output = ''
+
+        failures = re.findall(r'^(?:FAIL|ERROR):.*$', output, re.MULTILINE)
+        failed_modules = set()
+        for line in failures:
+            m = re.search(r'(?:FAIL|ERROR):\s+(\w+)\.', line)
+            if m:
+                failed_modules.add(m.group(1))
+
+        with open('/tmp/failed_modules.txt', 'w') as f:
+            f.write('\n'.join(sorted(failed_modules)))
+
+        with open('/tmp/failure_lines.txt', 'w') as f:
+            f.write('\n'.join(failures[:50]))
+
+        print(f"Failed modules: {sorted(failed_modules)}")
+        PYEOF
+
+    - name: Generate app token
+      if: failure()
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Create GitHub issue for nightly failure
+      if: failure()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.gen-token.outputs.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        python3 - <<'PYEOF'
+        import os, subprocess
+        from datetime import datetime
+        import zoneinfo
+
+        date    = datetime.now(zoneinfo.ZoneInfo("America/Asuncion")).strftime("%Y-%m-%d")
+        run_url = os.environ['RUN_URL']
+
+        failed_modules  = open('/tmp/failed_modules.txt').read().strip() \
+            if os.path.exists('/tmp/failed_modules.txt') else 'unknown'
+        failure_lines   = open('/tmp/failure_lines.txt').read().strip() \
+            if os.path.exists('/tmp/failure_lines.txt') else ''
+        output_tail     = open('/tmp/nightly-output.txt').read()[-8000:] \
+            if os.path.exists('/tmp/nightly-output.txt') else ''
+
+        modules_list = '\n'.join(f'- {m}' for m in failed_modules.splitlines() if m) \
+            or '- (could not determine)'
+
+        body = f"""## Nightly test suite failure — {date}
+
+The scheduled full test run on branch `19.0` failed.
+
+**Run:** {run_url}
+**Date:** {date} (Paraguay time)
+
+### Failed modules
+
+{modules_list}
+
+### Failure lines
+
+```
+{failure_lines[:3000]}
+```
+
+<details>
+<summary>Last 100 lines of test output</summary>
+
+```
+{output_tail}
+```
+</details>
+
+---
+*Opened automatically by unifox-ci. Close this issue once the failures are resolved.*
+"""
+
+        with open('/tmp/issue_body.md', 'w') as f:
+            f.write(body)
+
+        title  = f"[NIGHTLY] Test suite failure - {date}"
+        result = subprocess.run(
+            ['gh', 'issue', 'create',
+             '--repo', os.environ['GITHUB_REPOSITORY'],
+             '--title', title,
+             '--body-file', '/tmp/issue_body.md',
+             '--label', 'bug,nightly'],
+            capture_output=True, text=True,
+        )
+
+        if result.returncode != 0:
+            result = subprocess.run(
+                ['gh', 'issue', 'create',
+                 '--repo', os.environ['GITHUB_REPOSITORY'],
+                 '--title', title,
+                 '--body-file', '/tmp/issue_body.md'],
+                capture_output=True, text=True,
+            )
+
+        if result.returncode != 0:
+            print(f"Failed to create issue: {result.stderr}")
+            raise SystemExit(1)
+
+        print(f"Issue created: {result.stdout.strip()}")
+        PYEOF
