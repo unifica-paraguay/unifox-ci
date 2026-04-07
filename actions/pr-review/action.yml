@@ -525,12 +525,15 @@ runs:
             if r_reply.returncode == 0:
                 gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
                        '{thread{id isResolved}}}')
-                subprocess.run(
+                gql_r = subprocess.run(
                     ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
                     capture_output=True, text=True,
                 )
-                auto_resolved += 1
-                print(f'Auto-resolved thread for comment {cid}')
+                if gql_r.returncode == 0:
+                    auto_resolved += 1
+                    print(f'Auto-resolved thread for comment {cid}')
+                else:
+                    print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
         if auto_resolved:
             print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
 
