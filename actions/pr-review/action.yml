@@ -309,25 +309,46 @@ runs:
             "- new_comments: max 8 items, new issues only",
             "- reply_to: one entry per previous comment that needs follow-up action",
             "- All text in English \u2014 no markdown fences outside the JSON",
+            "- PR title scope may be a directory path such as '.github' or 'unifica_payment' \u2014 do NOT flag dots or underscores in scope names as invalid",
         ]
 
-        open('/tmp/review_prompt.txt', 'w').write('\n'.join(prompt_parts))
-        print(f"Prompt written ({len('\n'.join(prompt_parts))} chars), follow-up={bool(prev)}")
+        # If the diff is empty (no reviewable content) and no prior pending issues,
+        # skip the API call entirely and emit a pre-approved result.
+        if not diff.strip() and not pending:
+            import json as _json
+            _json.dump({
+                'verdict': 'APPROVED',
+                'summary': 'No reviewable changes in this PR (no Python, manifest, or XML files modified). Automatically approved.',
+                'new_comments': [],
+                'reply_to': [],
+            }, open('/tmp/review_parsed.json', 'w'))
+            print("Diff is empty and no pending issues — auto-approved, skipping Claude call")
+        else:
+            open('/tmp/review_prompt.txt', 'w').write('\n'.join(prompt_parts))
+            print(f"Prompt written ({len('\n'.join(prompt_parts))} chars), follow-up={bool(prev)}")
+
         PYEOF
 
-        python "${SCRIPTS_DIR}/claude_api.py" < /tmp/review_prompt.txt > /tmp/review_raw.json
+        if [ ! -f /tmp/review_parsed.json ]; then
+          python "${SCRIPTS_DIR}/claude_api.py" < /tmp/review_prompt.txt > /tmp/review_raw.json
+        fi
 
         python3 - <<'PYEOF'
-        import json
+        import json, os
 
-        raw = open('/tmp/review_raw.json').read().strip()
-        if raw.startswith('```'):
-            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            print(f"Warning: could not parse response ({e}) — safe fallback")
-            data = {'verdict': 'COMMENT', 'summary': 'Review parse error.', 'new_comments': [], 'reply_to': []}
+        # Skip parsing if auto-approved path already wrote the parsed file
+        if os.path.exists('/tmp/review_parsed.json'):
+            data = json.load(open('/tmp/review_parsed.json'))
+            print(f"Using pre-built result: {data['verdict']}")
+        else:
+            raw = open('/tmp/review_raw.json').read().strip()
+            if raw.startswith('```'):
+                raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                print(f"Warning: could not parse response ({e}) — safe fallback")
+                data = {'verdict': 'COMMENT', 'summary': 'Review parse error.', 'new_comments': [], 'reply_to': []}
 
         if 'veredicto' in data and 'verdict' not in data:
             data['verdict'] = data.pop('veredicto')
