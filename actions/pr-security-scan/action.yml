@@ -184,7 +184,8 @@ runs:
         # Skip generated / binary / lock files
         SKIP_DIRS  = {'node_modules', 'dist', 'build', '.next', '.astro', '__pycache__', '.venv', 'venv'}
         SKIP_EXTS  = {'.lock', '.pyc', '.min.js', '.map', '.png', '.jpg', '.gif', '.svg', '.woff', '.ttf',
-                      '.yml', '.yaml'}   # CI/config files — not production code; skip to avoid self-scan FP
+                      '.yml', '.yaml',   # CI/config files — not production code
+                      '.md', '.rst'}     # documentation files
         SKIP_NAMES = {'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
 
         findings = []  # list of dicts: file, line, severity, label, snippet
