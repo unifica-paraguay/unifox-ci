@@ -894,22 +894,13 @@ runs:
         # Only count as "newly done" comments that were actually pending before this review.
         # Avoids double-counting threads that were resolved externally (e.g. via GraphQL)
         # before the review ran — those are already in the already-resolved count.
-        newly_done  = sum(1 for re in data.get('reply_to', [])
-                          if re.get('resolved') and re.get('comment_id') in pending_ids)
-        newly_done += auto_resolved
-        now_pending = max(0, was_pending - newly_done)
-        now_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done
-        new_count   = len([c for c in data.get('new_comments', [])
-                           if c.get('path') and isinstance(c.get('line'), int)])
+        newly_done_count  = sum(1 for re in data.get('reply_to', [])
+                                if re.get('resolved') and re.get('comment_id') in pending_ids)
+        newly_done_count += auto_resolved
 
-        parts = []
-        if now_resolved:
-            parts.append(f'{now_resolved} resolved')
-        if now_pending:
-            parts.append(f'{now_pending} pending')
-        if new_count:
-            parts.append(f'{new_count} new')
-        status_str = ' \u00b7 '.join(parts) if parts else 'no issues'
+        newly_done_count = sum(1 for re in data.get('reply_to', [])
+                               if re.get('resolved') and re.get('comment_id') in pending_ids)
+        newly_done_count += auto_resolved
 
         verdict = data.get('verdict', 'COMMENT')
 
@@ -921,10 +912,9 @@ runs:
         if static_checks_failed and verdict == 'APPROVED':
             verdict = 'CHANGES_REQUESTED'
             override_note = (
-                '\n\n---\n'
-                '> **Pipeline checks are failing.** The code looks good, but the PR cannot '
-                'be approved while static checks (commit messages, lint, PR size, …) are red. '
-                'Fix those first, then re-push.'
+                '\n\n> \u26a0\ufe0f **Pipeline checks are failing.** '
+                'The code looks good, but the PR cannot be approved while static checks '
+                '(commit messages, lint, PR size, \u2026) are red. Fix those first, then re-push.'
             )
             print('Static checks failed — overriding APPROVED → CHANGES_REQUESTED')
 
@@ -934,14 +924,31 @@ runs:
             'COMMENT':           '\U0001f4ac',
         }.get(verdict, '\U0001f4ac')
 
+        # ── Compact header: verdict + counts on one scannable line ─────────────
+        n_critical = sum(1 for c in data.get('new_comments', []) if c.get('severity') == 'critical')
+        n_warning  = sum(1 for c in data.get('new_comments', []) if c.get('severity') == 'warning')
+        still_pending = max(0, was_pending - newly_done_count)
+        just_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done_count
+
+        chips = []
+        if n_critical:
+            chips.append(f'\U0001f534 {n_critical} critical')
+        if n_warning:
+            chips.append(f'\U0001f7e1 {n_warning} warning')
+        if still_pending:
+            chips.append(f'\u21a9\ufe0f {still_pending} pending')
+        if just_resolved:
+            chips.append(f'\u2714\ufe0f {just_resolved} resolved')
+        chips_str = ' \u00b7 '.join(chips) if chips else 'no issues'
+
+        verdict_label = verdict.replace('_', ' ').title()
+        header_line = f'{verdict_icon} **{verdict_label}** \u00b7 {chips_str}'
+
         rev_body_parts = [
             '<!-- unifox-review -->',
-            '',
-            f'{verdict_icon} **{verdict.replace("_", " ").title()}**',
+            header_line,
             '',
             data.get('summary', ''),
-            '',
-            f'**Issues:** {status_str}',
         ]
 
         rev_body = '\n'.join(rev_body_parts) + override_note
@@ -971,23 +978,16 @@ runs:
         r = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')
         if r.returncode != 0:
             # Inline comments were rejected (line numbers not in diff).
-            # Rebuild the body without the inline count so the summary is accurate.
-            fb_parts = []
-            if now_resolved:
-                fb_parts.append(f'{now_resolved} resolved')
-            if now_pending:
-                fb_parts.append(f'{now_pending} pending')
-            fb_status = ' \u00b7 '.join(fb_parts) if fb_parts else 'No issues found'
+            # Reuse the same compact header; append an inline-note if needed.
             note = ''
             if inline:
-                note = (f'\n\n_Note: {len(inline)} suggestion(s) could not be attached as inline '
-                        f'comments (line numbers not present in diff). See summary above._')
+                note = (f'\n\n_Note: {len(inline)} suggestion(s) could not be attached as '
+                        f'inline comments (line numbers not present in diff)._')
             fallback_body = '\n'.join([
                 '<!-- unifox-review -->',
+                header_line,
                 '',
                 data.get('summary', '') + note,
-                '',
-                f'**Issues:** {fb_status}',
             ])
             payload['comments'] = []
             payload['body'] = fallback_body

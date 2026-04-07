@@ -417,15 +417,6 @@ runs:
         import os, subprocess
         from datetime import datetime, timezone
 
-        def icon(o):
-            return {
-                'success':  '\u2705',
-                'failure':  '\u274c',
-                'skipped':  '\u23ed\ufe0f',
-                '':         '\u23ed\ufe0f',
-            }.get(o, '\u23ed\ufe0f')
-
-        branch   = os.environ['BRANCH']
         modules  = os.environ['MODULES']
         profile  = os.environ.get('PROFILE', 'default')
         existing = os.environ['EXISTING_COMMENT_ID'].strip()
@@ -449,72 +440,77 @@ runs:
             'tests_pytest': os.environ['TESTS_PYTEST_OUTCOME'],
         }
 
-        has_failure = any(v == 'failure' for v in outcomes.values())
-        overall = '\u274c Some checks failed' if has_failure else '\u2705 All checks passed'
-
         rows = [
             ('Commit messages', outcomes['commits']),
-            ('Branch naming', outcomes['branch']),
-            ('PR size', outcomes['pr_size']),
+            ('Branch naming',   outcomes['branch']),
+            ('PR size',         outcomes['pr_size']),
         ]
         if profile == 'odoo':
             rows += [
-                ('Version bump', outcomes['version']),
+                ('Version bump',         outcomes['version']),
                 ('Manifest & structure', outcomes['manifest']),
-                ('Tests exist (Odoo)', outcomes['tests_odoo']),
-                ('Lint \u2014 Python (flake8)', outcomes['lint_py']),
+                ('Tests exist',          outcomes['tests_odoo']),
+                ('Lint (flake8)',         outcomes['lint_py']),
             ]
         elif profile in ('react', 'astro', 'node'):
             rows += [
-                ('Lint \u2014 ESLint', outcomes['lint_eslint']),
-                ('Type check (tsc)', outcomes['typecheck']),
+                ('ESLint',       outcomes['lint_eslint']),
+                ('Type check',   outcomes['typecheck']),
             ]
             if profile == 'astro':
                 rows.append(('Astro check', outcomes['astro_check']))
             rows.append(('Tests', outcomes['tests_node']))
         elif profile == 'python':
             rows += [
-                ('Lint \u2014 Python (flake8)', outcomes['lint_py']),
+                ('Lint (flake8)', outcomes['lint_py']),
                 ('Tests (pytest)', outcomes['tests_pytest']),
             ]
         else:
             rows += [
-                ('Lint \u2014 Python (flake8)', outcomes['lint_py']),
-                ('Lint \u2014 ESLint', outcomes['lint_eslint']),
-                ('Type check (tsc)', outcomes['typecheck']),
+                ('Lint (flake8)', outcomes['lint_py']),
+                ('ESLint',        outcomes['lint_eslint']),
+                ('Type check',    outcomes['typecheck']),
             ]
 
-        # Filter skipped rows for cleaner output
-        table_rows = [(label, o) for label, o in rows if o and o != 'skipped' and o != '']
-        skipped_rows = [(label, o) for label, o in rows if not o or o in ('skipped', '')]
+        failed  = [(l, o) for l, o in rows if o == 'failure']
+        passed  = [(l, o) for l, o in rows if o == 'success']
+        skipped = [(l, o) for l, o in rows if o not in ('failure', 'success')]
 
-        table = ['| Check | Status |', '|-------|--------|']
-        for label, o in table_rows:
-            table.append(f'| {label} | {icon(o)} |')
+        # ── Header line ────────────────────────────────────────────────────────
+        if failed:
+            pill = f'\u274c {len(failed)} failed'
+        else:
+            pill = '\u2705 All passed'
+        header = f'\U0001f98a **Static Checks** \u00b7 `{profile}` \u00b7 {pill} \u00b7 [log \u2192]({run_url})'
 
-        skipped_note = ''
-        if skipped_rows:
-            skipped_labels = ', '.join(f'_{l}_' for l, _ in skipped_rows)
-            skipped_note = f'\n_Skipped (not applicable): {skipped_labels}_'
+        # ── Body ───────────────────────────────────────────────────────────────
+        lines = ['<!-- unifox-static-checks -->', header, '']
 
-        module_line = ''
-        if profile == 'odoo':
-            module_line = f'\n**Modified modules:** {modules or "_none_"}'
+        # Failures — one line each, prominent
+        for label, _ in failed:
+            lines.append(f'\u274c **{label}**')
+        if failed:
+            lines.append('')
 
-        body_parts = [
-            '<!-- unifox-static-checks -->',
-            f'## \U0001f98a Static Checks \u2014 `{profile}` profile',
-            '',
-            f'**{overall}**',
-            '',
-            '\n'.join(table),
-            skipped_note,
-            module_line,
-            '',
-            '---',
-            f'_Last verified: {ts} \u2014 [View full log]({run_url})_',
-        ]
-        body = '\n'.join(p for p in body_parts if p is not None)
+        # Passed — compact single line
+        if passed:
+            lines.append(' \u00b7 '.join(f'\u2705 {l}' for l, _ in passed))
+            lines.append('')
+
+        # Skipped — collapsed detail block
+        if skipped:
+            skip_str = ' \u00b7 '.join(l for l, _ in skipped)
+            lines.append(f'<details><summary>\u23ed\ufe0f {len(skipped)} skipped</summary>\n\n{skip_str}\n\n</details>')
+            lines.append('')
+
+        # Odoo modules
+        if profile == 'odoo' and modules:
+            lines.append(f'**Modules:** `{modules}`')
+            lines.append('')
+
+        lines.append(f'_{ts}_')
+
+        body = '\n'.join(lines)
         open('/tmp/static-comment.md', 'w').write(body)
 
         if existing and existing != 'null':
