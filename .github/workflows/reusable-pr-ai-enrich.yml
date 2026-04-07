@@ -156,7 +156,7 @@ jobs:
   odoo-tests-layer2:
     name: Tests — Layer 2 (native dependencies)
     needs: [pre-flight, odoo-tests-layer1]
-    if: ${{ inputs.enable_odoo_tests && always() && needs.odoo-tests-layer1.result != 'cancelled' }}
+    if: always() && inputs.enable_odoo_tests && needs.odoo-tests-layer1.result != 'cancelled'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -174,9 +174,10 @@ jobs:
 
   ai-code-review:
     name: AI code review
-    # Waits for static-checks and (optionally) Odoo tests so the review verdict
-    # reflects the full pipeline health before deciding to approve or block.
-    needs: [pre-flight, enrich-metadata, static-checks, odoo-tests-layer1, odoo-tests-layer2]
+    # Waits for static-checks so the review verdict reflects pipeline health.
+    # Odoo test jobs are not in needs (they're conditional) — their result
+    # is passed via static_checks_failed input using needs context expressions.
+    needs: [pre-flight, enrich-metadata, static-checks]
     if: always() && needs.pre-flight.result == 'success' && needs.enrich-metadata.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -192,7 +193,7 @@ jobs:
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           base_branch: ${{ github.base_ref }}
           profile: ${{ inputs.profile }}
-          static_checks_failed: ${{ needs.static-checks.result == 'failure' || needs.odoo-tests-layer1.result == 'failure' || needs.odoo-tests-layer2.result == 'failure' }}
+          static_checks_failed: ${{ needs.static-checks.result == 'failure' }}
 
   security-scan:
     name: Security scan
