@@ -58,19 +58,52 @@ runs:
         BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
         git fetch origin "$BASE_BRANCH"
-        PY_DIFF=$(git diff "origin/${BASE_BRANCH}...HEAD" -- '*.py' ':!*/static/*' ':!*/__pycache__/*')
-        XML_DIFF=$(git diff "origin/${BASE_BRANCH}...HEAD" -- '*.xml')
-        MANIFEST_DIFF=$(git diff "origin/${BASE_BRANCH}...HEAD" -- '*/__manifest__.py')
-        {
-          echo "=== Python files ==="
-          echo "$PY_DIFF"
-          echo ""
-          echo "=== Manifest files ==="
-          echo "$MANIFEST_DIFF"
-          echo ""
-          echo "=== XML files ==="
-          echo "$XML_DIFF"
-        } | head -c 48000 > /tmp/review_diff.txt
+
+        # Collect diffs in priority order, truncating to 48 KB total.
+        # Priority: .py > __manifest__.py > .xml > .yml/.yaml > .sh > rest
+        python3 - <<'DIFFEOF'
+        import os, subprocess
+        from pathlib import Path
+
+        base = os.environ['BASE_BRANCH']
+
+        def diff(patterns, extra_excludes=None):
+            args = ['git', 'diff', f'origin/{base}...HEAD', '--'] + list(patterns)
+            r = subprocess.run(args, capture_output=True, text=True)
+            return r.stdout
+
+        sections = [
+            ('Python files',        diff(['*.py', ':!*/static/*', ':!*/__pycache__/*'])),
+            ('Manifest files',      diff(['*/__manifest__.py'])),
+            ('XML files',           diff(['*.xml'])),
+            ('YAML/config files',   diff(['*.yml', '*.yaml', '.flake8', '.unifox.yml',
+                                          '*.cfg', '*.conf', '*.ini'])),
+            ('Shell scripts',       diff(['*.sh'])),
+            ('Docker files',        diff(['docker-compose*', 'Dockerfile*'])),
+            ('Markdown files',      diff(['*.md'])),
+        ]
+
+        limit = 48000
+        used  = 0
+        parts = []
+        for label, content in sections:
+            if not content.strip():
+                continue
+            header = f'=== {label} ===\n'
+            chunk  = header + content + '\n'
+            remaining = limit - used
+            if remaining <= len(header) + 10:
+                break
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining] + '\n... (truncated)\n'
+            parts.append(chunk)
+            used += len(chunk)
+            if used >= limit:
+                break
+
+        Path('/tmp/review_diff.txt').write_text('\n'.join(parts))
+        print(f"Diff collected: {used} bytes across {len(parts)} section(s)")
+        DIFFEOF
 
         BASE_BRANCH="${BASE_BRANCH}" python3 - <<'PYEOF'
         import ast, os, subprocess
@@ -293,6 +326,23 @@ runs:
             "6. Manifest: version bump, correct depends, all new files listed in data/assets",
             "7. Performance: N+1 queries, missing sudo() where appropriate, unnecessary iterations",
             "8. Field naming: custom fields must use module prefix (e.g. bancard_public_key)",
+            "9. YAML workflow files (.github/workflows/*.yml):",
+            "   - Secret names must match org standard: UNIFOX_CI_APP_ID, UNIFOX_CI_PRIVATE_KEY, ANTHROPIC_API_KEY",
+            "   - Action refs must be consistent (@main or a pinned version, not mixed)",
+            "   - permissions blocks must be minimal (only what the job actually needs)",
+            "   - Workflow triggers must make sense for the job's purpose",
+            "   - Flag any hardcoded values that should be secrets or inputs",
+            "10. docker-compose and Dockerfile:",
+            "    - No hardcoded credentials or sensitive values",
+            "    - Volume mounts must make sense and not expose the host unnecessarily",
+            "    - Flag deprecated syntax",
+            "11. Shell scripts (.sh):",
+            "    - Missing error handling: scripts must start with 'set -e' and 'set -o pipefail' (or equivalent)",
+            "    - Commands that can fail silently (pipes without error propagation)",
+            "    - Variables must be quoted to avoid word splitting",
+            "12. .unifox.yml and other config files:",
+            "    - Required fields must be present",
+            "    - Values must be consistent with the repo's actual structure",
             "",
             'Output ONLY a valid JSON object:',
             '{',
@@ -312,17 +362,18 @@ runs:
             "- PR title scope may be a directory path such as '.github' or 'unifica_payment' \u2014 do NOT flag dots or underscores in scope names as invalid",
         ]
 
-        # If the diff is empty (no reviewable content) and no prior pending issues,
-        # skip the API call entirely and emit a pre-approved result.
+        # Auto-approve only when the diff is genuinely empty (no files of any type changed)
+        # and there are no prior pending issues. YAML, shell, docker, config files all
+        # warrant a real review — only skip Claude when there is truly nothing to review.
         if not diff.strip() and not pending:
             import json as _json
             _json.dump({
                 'verdict': 'APPROVED',
-                'summary': 'No reviewable changes in this PR (no Python, manifest, or XML files modified). Automatically approved.',
+                'summary': 'No changes detected in this PR. Automatically approved.',
                 'new_comments': [],
                 'reply_to': [],
             }, open('/tmp/review_parsed.json', 'w'))
-            print("Diff is empty and no pending issues — auto-approved, skipping Claude call")
+            print("Diff is genuinely empty and no pending issues — auto-approved, skipping Claude call")
         else:
             open('/tmp/review_prompt.txt', 'w').write('\n'.join(prompt_parts))
             print(f"Prompt written ({len('\n'.join(prompt_parts))} chars), follow-up={bool(prev)}")
