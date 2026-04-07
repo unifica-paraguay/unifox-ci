@@ -46,21 +46,23 @@ runs:
         app-id: ${{ inputs.unifox_app_id }}
         private-key: ${{ inputs.unifox_private_key }}
 
-    - name: Resolve token
+    - name: Require app token
       id: token
       shell: bash
       env:
         APP_TOKEN: ${{ steps.gen-token.outputs.token }}
-        FALLBACK_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
       run: |
         if [ -n "$APP_TOKEN" ]; then
           echo "value=${APP_TOKEN}" >> "$GITHUB_OUTPUT"
           echo "Token: using GitHub App (unifox-ci[bot])"
-        else
-          echo "value=${FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
-          echo "WARNING: GitHub App token unavailable — falling back to github-actions[bot]"
-          echo "Fix: install the unifox-ci GitHub App on this repository (GitHub Settings → Apps)."
+          exit 0
         fi
+        ORG="${REPO%%/*}"
+        echo "ERROR: unifox-ci GitHub App is not installed on this repository."
+        echo "Install it at https://github.com/apps/unifox-ci"
+        echo "or enable it for this repository at https://github.com/organizations/${ORG}/settings/installations"
+        exit 1
 
     - name: Set up Python
       uses: actions/setup-python@v5

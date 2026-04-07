@@ -51,17 +51,21 @@ jobs:
           app-id: ${{ secrets.UNIFOX_CI_APP_ID }}
           private-key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
 
-      - name: Warn if bot token unavailable
+      - name: Require app token
         shell: bash
         env:
           BOT_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ -z "$BOT_TOKEN" ]; then
-            echo "WARNING: GitHub App token unavailable — release will be created as github-actions[bot]"
-            echo "Fix: install the unifox-ci GitHub App on this repository (GitHub Settings → Apps)."
-          else
+          if [ -n "$BOT_TOKEN" ]; then
             echo "Token: using GitHub App (unifox-ci[bot])"
+            exit 0
           fi
+          ORG="${REPO%%/*}"
+          echo "ERROR: unifox-ci GitHub App is not installed on this repository."
+          echo "Install it at https://github.com/apps/unifox-ci"
+          echo "or enable it at https://github.com/organizations/${ORG}/settings/installations"
+          exit 1
 
       - uses: actions/checkout@v4
         with:
