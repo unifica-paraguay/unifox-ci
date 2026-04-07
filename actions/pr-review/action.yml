@@ -162,6 +162,61 @@ runs:
         print(f"Convention extraction: {len(changed)} file(s) scanned")
         PYEOF
 
+        # Collect full current content of changed files so Claude has complete
+        # context — not just the diff hunk. Without this, Claude misses declarations
+        # that sit outside the changed lines (e.g. shell: bash above a run: block,
+        # variable assignments above the line where they are used).
+        #
+        # Strategy:
+        #   - YAML/shell/Dockerfile: always include in full (small, dense with context)
+        #   - Python/XML/other: include only if the file is small (< 4 KB)
+        #   - Total budget: 20 KB — keeps the prompt manageable
+        #   - Deleted files (not present on disk) are skipped automatically
+        BASE_BRANCH="${BASE_BRANCH}" python3 - <<'FULLEOF'
+        import os, subprocess
+        from pathlib import Path
+
+        base    = os.environ.get('BASE_BRANCH', 'main')
+        BUDGET  = 20000          # 20 KB total for full file contents
+        PY_MAX  = 4000           # include Python/XML/other only if file is this small
+        ALWAYS  = {'.yml', '.yaml', '.sh', '.bash'}  # always include regardless of size
+
+        result = subprocess.run(
+            ['git', 'diff', '--diff-filter=AM', '--name-only', f'origin/{base}...HEAD'],
+            capture_output=True, text=True,
+        )
+        changed = [f for f in result.stdout.strip().splitlines() if f and Path(f).exists()]
+
+        parts = []
+        used  = 0
+
+        for fpath in changed:
+            p   = Path(fpath)
+            ext = p.suffix.lower()
+            try:
+                content = p.read_text(errors='replace')
+            except Exception:
+                continue
+
+            # Skip large non-YAML files; they are covered by the diff
+            if ext not in ALWAYS and len(content) > PY_MAX:
+                continue
+
+            remaining = BUDGET - used
+            if remaining <= 50:
+                break
+
+            header = f'=== Full file: {fpath} ===\n'
+            body   = header + content
+            if len(body) > remaining:
+                body = body[:remaining] + '\n... (truncated)\n'
+            parts.append(body)
+            used += len(body)
+
+        Path('/tmp/review_full_files.txt').write_text('\n\n'.join(parts))
+        print(f"Full file contents: {used} bytes across {len(parts)} file(s)")
+        FULLEOF
+
     - name: Collect existing review context
       shell: bash
       env:
@@ -266,6 +321,10 @@ runs:
             conventions = open('/tmp/review_conventions.txt').read()
         except FileNotFoundError:
             conventions = ''
+        try:
+            full_files = open('/tmp/review_full_files.txt').read().strip()
+        except FileNotFoundError:
+            full_files = ''
 
         pending  = [c for c in prev if not c['is_resolved']]
         resolved = [c for c in prev if c['is_resolved']]
@@ -322,8 +381,20 @@ runs:
                 "",
             ]
 
+        if full_files:
+            prompt_parts += [
+                "=== FULL CURRENT FILE CONTENTS ===",
+                "These are the COMPLETE current contents of every changed file (not just the diff).",
+                "Read these FIRST before reviewing the diff below.",
+                "Any declaration, assignment, or block visible here is present in the current code —",
+                "do NOT flag it as missing just because it does not appear in the diff hunk.",
+                "",
+                full_files,
+                "",
+            ]
+
         prompt_parts += [
-            "Current diff (first 48 KB):",
+            "Current diff (what changed in this PR):",
             "```diff",
             diff,
             "```",
