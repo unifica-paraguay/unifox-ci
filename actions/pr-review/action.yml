@@ -67,8 +67,11 @@ runs:
 
         base = os.environ['BASE_BRANCH']
 
-        def diff(patterns, extra_excludes=None):
-            args = ['git', 'diff', f'origin/{base}...HEAD', '--'] + list(patterns)
+        def diff(patterns):
+            # --diff-filter=AM: only Added/Modified files — excludes pure Deletions.
+            # This prevents large "extract to separate repo" PRs from consuming the
+            # entire budget with removed lines that carry no reviewable new content.
+            args = ['git', 'diff', '--diff-filter=AM', f'origin/{base}...HEAD', '--'] + list(patterns)
             r = subprocess.run(args, capture_output=True, text=True)
             return r.stdout
 
