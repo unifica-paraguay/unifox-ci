@@ -60,6 +60,8 @@ jobs:
           INSTALL_URL="https://github.com/apps/unifox-ci"
           SETTINGS_URL="https://github.com/organizations/${ORG}/settings/installations"
           MSG=$(printf '## ⚠️ unifox-ci not installed\n\nThis workflow requires the **unifox-ci** GitHub App. Without it, CI cannot post review comments or enrichments on this repository.\n\n**To fix:** [Install unifox-ci →](%s)\nOr enable it for this repo in your [organization app settings](%s).\n\nOnce installed, re-run this workflow.' "$INSTALL_URL" "$SETTINGS_URL")
+          # || true is intentional: a failure to post the helpful comment must not
+          # mask the real error. The exit 1 below is what actually fails the job.
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$MSG" || true
           echo "ERROR: unifox-ci GitHub App is not installed — install it to unblock CI."
           exit 1
