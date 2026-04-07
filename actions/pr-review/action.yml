@@ -375,8 +375,9 @@ runs:
             }, open('/tmp/review_parsed.json', 'w'))
             print("Diff is genuinely empty and no pending issues — auto-approved, skipping Claude call")
         else:
-            open('/tmp/review_prompt.txt', 'w').write('\n'.join(prompt_parts))
-            print(f"Prompt written ({len('\n'.join(prompt_parts))} chars), follow-up={bool(prev)}")
+            prompt_text = '\n'.join(prompt_parts)
+            open('/tmp/review_prompt.txt', 'w').write(prompt_text)
+            print(f"Prompt written ({len(prompt_text)} chars), follow-up={bool(prev)}")
 
         PYEOF
 
