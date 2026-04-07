@@ -50,7 +50,15 @@ runs:
       env:
         APP_TOKEN: ${{ steps.gen-token.outputs.token }}
         FALLBACK_TOKEN: ${{ github.token }}
-      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "value=${APP_TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Token: using GitHub App (unifox-ci[bot])"
+        else
+          echo "value=${FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "WARNING: GitHub App token unavailable — falling back to github-actions[bot]"
+          echo "Fix: install the unifox-ci GitHub App on this repository (GitHub Settings → Apps)."
+        fi
 
     - name: Set up Python
       uses: actions/setup-python@v5
