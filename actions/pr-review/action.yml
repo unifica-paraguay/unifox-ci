@@ -288,6 +288,11 @@ runs:
                 "- NEVER duplicate a new_comment at a (path, line) that already has a pending comment",
                 "- NEVER approve while any pending issue remains unresolved",
                 "- Be consistent: if code was wrong before and has not changed, it is still wrong",
+                "- **RESOLVED THREADS ARE CLOSED DECISIONS**: a resolved comment means the developer reviewed",
+                "  your feedback and deliberately chose the current code. Do NOT re-flag the same pattern,",
+                "  file, or concern from a resolved thread — doing so causes infinite review loops.",
+                "  If you believe a resolved issue hides a critical bug, note it ONCE in new_comments with",
+                "  explicit reasoning; do not repeat the same comment on subsequent pushes.",
             ])
         else:
             context_block = "This is the first review of this PR."

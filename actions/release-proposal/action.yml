@@ -360,7 +360,8 @@ runs:
                     '--input', tmp.name,
                 ], env=env, capture_output=True, text=True)
             finally:
-                os.unlink(tmp.name)
+                from pathlib import Path
+                Path(tmp.name).unlink(missing_ok=True)
             if r_comment.returncode != 0:
                 print(f'Warning: could not post proposal comment on PR #{pr_number}: '
                       f'{r_comment.stderr.strip()}')
