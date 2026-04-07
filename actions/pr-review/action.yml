@@ -35,13 +35,19 @@ runs:
         app-id: ${{ inputs.unifox_app_id }}
         private-key: ${{ inputs.unifox_private_key }}
 
-    - name: Resolve token
+    - name: Require app token
       id: token
       shell: bash
       env:
         APP_TOKEN: ${{ steps.gen-token.outputs.token }}
-        FALLBACK_TOKEN: ${{ github.token }}
-      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "value=${APP_TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Token: using GitHub App (unifox-ci[bot])"
+          exit 0
+        fi
+        echo "ERROR: unifox-ci GitHub App is not installed — install it at https://github.com/apps/unifox-ci"
+        exit 1
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -156,6 +162,61 @@ runs:
         print(f"Convention extraction: {len(changed)} file(s) scanned")
         PYEOF
 
+        # Collect full current content of changed files so Claude has complete
+        # context — not just the diff hunk. Without this, Claude misses declarations
+        # that sit outside the changed lines (e.g. shell: bash above a run: block,
+        # variable assignments above the line where they are used).
+        #
+        # Strategy:
+        #   - YAML/shell/Dockerfile: always include in full (small, dense with context)
+        #   - Python/XML/other: include only if the file is small (< 4 KB)
+        #   - Total budget: 20 KB — keeps the prompt manageable
+        #   - Deleted files (not present on disk) are skipped automatically
+        BASE_BRANCH="${BASE_BRANCH}" python3 - <<'FULLEOF'
+        import os, subprocess
+        from pathlib import Path
+
+        base    = os.environ.get('BASE_BRANCH', 'main')
+        BUDGET  = 20000          # 20 KB total for full file contents
+        PY_MAX  = 4000           # include Python/XML/other only if file is this small
+        ALWAYS  = {'.yml', '.yaml', '.sh', '.bash'}  # always include regardless of size
+
+        result = subprocess.run(
+            ['git', 'diff', '--diff-filter=AM', '--name-only', f'origin/{base}...HEAD'],
+            capture_output=True, text=True,
+        )
+        changed = [f for f in result.stdout.strip().splitlines() if f and Path(f).exists()]
+
+        parts = []
+        used  = 0
+
+        for fpath in changed:
+            p   = Path(fpath)
+            ext = p.suffix.lower()
+            try:
+                content = p.read_text(errors='replace')
+            except Exception:
+                continue
+
+            # Skip large non-YAML files; they are covered by the diff
+            if ext not in ALWAYS and len(content) > PY_MAX:
+                continue
+
+            remaining = BUDGET - used
+            if remaining <= 50:
+                break
+
+            header = f'=== Full file: {fpath} ===\n'
+            body   = header + content
+            if len(body) > remaining:
+                body = body[:remaining] + '\n... (truncated)\n'
+            parts.append(body)
+            used += len(body)
+
+        Path('/tmp/review_full_files.txt').write_text('\n\n'.join(parts))
+        print(f"Full file contents: {used} bytes across {len(parts)} file(s)")
+        FULLEOF
+
     - name: Collect existing review context
       shell: bash
       env:
@@ -260,6 +321,10 @@ runs:
             conventions = open('/tmp/review_conventions.txt').read()
         except FileNotFoundError:
             conventions = ''
+        try:
+            full_files = open('/tmp/review_full_files.txt').read().strip()
+        except FileNotFoundError:
+            full_files = ''
 
         pending  = [c for c in prev if not c['is_resolved']]
         resolved = [c for c in prev if c['is_resolved']]
@@ -274,12 +339,19 @@ runs:
                 f"Already resolved: {len(resolved)}",
                 "",
                 "FOLLOW-UP RULES \u2014 strictly enforced:",
-                "- Pending issue NOW FIXED in the diff below \u2192 put in reply_to with resolved=true",
-                "- Pending issue STILL PRESENT and unchanged \u2192 put in reply_to with resolved=false; do NOT create a new_comment at that location",
+                "- **MANDATORY**: Generate a reply_to entry for EVERY pending comment above \u2014 no exceptions, no omissions.",
+                "  For each comment_id in the pending list: check the current diff and either mark resolved=true (fixed) or resolved=false (still present).",
+                "- Pending issue NOW FIXED in the diff below \u2192 reply_to with resolved=true",
+                "- Pending issue STILL PRESENT and unchanged \u2192 reply_to with resolved=false; do NOT create a new_comment at that location",
                 "- Only genuinely NEW issues (not in the list above) go in new_comments",
                 "- NEVER duplicate a new_comment at a (path, line) that already has a pending comment",
                 "- NEVER approve while any pending issue remains unresolved",
                 "- Be consistent: if code was wrong before and has not changed, it is still wrong",
+                "- **RESOLVED THREADS ARE CLOSED DECISIONS**: a resolved comment means the developer reviewed",
+                "  your feedback and deliberately chose the current code. Do NOT re-flag the same pattern,",
+                "  file, or concern from a resolved thread — doing so causes infinite review loops.",
+                "  If you believe a resolved issue hides a critical bug, note it ONCE in new_comments with",
+                "  explicit reasoning; do not repeat the same comment on subsequent pushes.",
             ])
         else:
             context_block = "This is the first review of this PR."
@@ -309,8 +381,20 @@ runs:
                 "",
             ]
 
+        if full_files:
+            prompt_parts += [
+                "=== FULL CURRENT FILE CONTENTS ===",
+                "These are the COMPLETE current contents of every changed file (not just the diff).",
+                "Read these FIRST before reviewing the diff below.",
+                "Any declaration, assignment, or block visible here is present in the current code —",
+                "do NOT flag it as missing just because it does not appear in the diff hunk.",
+                "",
+                full_files,
+                "",
+            ]
+
         prompt_parts += [
-            "Current diff (first 48 KB):",
+            "Current diff (what changed in this PR):",
             "```diff",
             diff,
             "```",
@@ -488,11 +572,55 @@ runs:
         prev        = ctx.get('prev_comments', [])
         pending_ids = {c['id'] for c in prev if not c['is_resolved']}
         was_pending = len(pending_ids)
+
+        # Auto-resolve: pending threads not explicitly carried forward as still-pending.
+        # Claude is instructed to generate reply_to for every pending comment, but as a
+        # safety net we resolve any it silently omitted (avoids comment accumulation).
+        explicitly_still_pending = {
+            r['comment_id'] for r in data.get('reply_to', [])
+            if not r.get('resolved', True)
+        }
+        already_replied_resolved = {
+            r.get('comment_id') for r in data.get('reply_to', []) if r.get('resolved')
+        }
+        auto_resolved = 0
+        for comment in prev:
+            cid = comment['id']
+            if comment['is_resolved'] or cid in explicitly_still_pending:
+                continue
+            if cid in already_replied_resolved:
+                continue  # already handled in the reply_to loop above
+            tid = c2t.get(cid, {}).get('thread_id')
+            if not tid:
+                print(f'Warning: no thread_id mapping for comment {cid} — cannot auto-resolve')
+                continue
+            # Resolve the thread first; only post the reply if resolution succeeds.
+            # This avoids a dangling reply comment when the GraphQL call fails.
+            gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
+                   '{thread{id isResolved}}}')
+            gql_r = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
+                capture_output=True, text=True,
+            )
+            if gql_r.returncode == 0:
+                auto_resolved += 1
+                print(f'Auto-resolved thread for comment {cid}')
+                gh(
+                    f'repos/{repo}/pulls/comments/{cid}/replies',
+                    body={'body': '\u2705 Addressed \u2014 closing thread.'},
+                    method='POST',
+                )
+            else:
+                print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
+        if auto_resolved:
+            print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
+
         # Only count as "newly done" comments that were actually pending before this review.
         # Avoids double-counting threads that were resolved externally (e.g. via GraphQL)
         # before the review ran — those are already in the already-resolved count.
         newly_done  = sum(1 for re in data.get('reply_to', [])
                           if re.get('resolved') and re.get('comment_id') in pending_ids)
+        newly_done += auto_resolved
         now_pending = max(0, was_pending - newly_done)
         now_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done
         new_count   = len([c for c in data.get('new_comments', [])
@@ -596,4 +724,20 @@ runs:
             'gh', 'pr', 'comment', os.environ['PR_NUMBER'],
             '--repo', os.environ['REPO'], '--body', msg,
         ], check=False)
+        PYEOF
+
+    - name: Fail if changes requested
+      shell: bash
+      run: |
+        python3 - <<'PYEOF'
+        import json, sys
+        try:
+            with open('/tmp/review_parsed.json') as f:
+                verdict = json.load(f).get('verdict', 'COMMENT')
+        except FileNotFoundError:
+            sys.exit(0)
+        if verdict == 'CHANGES_REQUESTED':
+            print("Review verdict: CHANGES_REQUESTED — failing check to block merge.")
+            sys.exit(1)
+        print(f"Review verdict: {verdict} — check passes.")
         PYEOF

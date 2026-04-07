@@ -46,13 +46,23 @@ runs:
         app-id: ${{ inputs.unifox_app_id }}
         private-key: ${{ inputs.unifox_private_key }}
 
-    - name: Resolve token
+    - name: Require app token
       id: token
       shell: bash
       env:
         APP_TOKEN: ${{ steps.gen-token.outputs.token }}
-        FALLBACK_TOKEN: ${{ github.token }}
-      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+        REPO: ${{ github.repository }}
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "value=${APP_TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Token: using GitHub App (unifox-ci[bot])"
+          exit 0
+        fi
+        ORG="${REPO%%/*}"
+        echo "ERROR: unifox-ci GitHub App is not installed on this repository."
+        echo "Install it at https://github.com/apps/unifox-ci"
+        echo "or enable it for this repository at https://github.com/organizations/${ORG}/settings/installations"
+        exit 1
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -232,18 +242,25 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         TAG_PREFIX: ${{ inputs.tag_prefix }}
         LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
         python3 - <<'PYEOF'
-        import json, os, subprocess
+        import json, os, subprocess, sys
 
-        data      = json.load(open('/tmp/release_parsed.json'))
-        repo      = os.environ['REPO']
-        sha       = os.environ['SHA']
-        run_url   = os.environ['RUN_URL']
-        tag_prefix = os.environ['TAG_PREFIX']
-        last_tag  = os.environ.get('LAST_TAG') or '(none — first release)'
-        gh_token  = os.environ['GH_TOKEN']
-        env       = {**os.environ, 'GH_TOKEN': gh_token}
+        try:
+            data = json.load(open('/tmp/release_parsed.json'))
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — 'Ask Claude for version bump' step likely failed.")
+            sys.exit(1)
+
+        repo        = os.environ['REPO']
+        sha         = os.environ['SHA']
+        run_url     = os.environ['RUN_URL']
+        tag_prefix  = os.environ['TAG_PREFIX']
+        last_tag    = os.environ.get('LAST_TAG') or '(none — first release)'
+        base_branch = os.environ.get('BASE_BRANCH', 'main')
+        gh_token    = os.environ['GH_TOKEN']
+        env         = {**os.environ, 'GH_TOKEN': gh_token}
 
         new_tag   = data['new_tag']
         bump_type = data['bump_type']
@@ -255,8 +272,23 @@ runs:
              '--header', 'Accept: application/vnd.github.v3+json'],
             capture_output=True, text=True, env=env,
         )
-        prs = json.loads(pr_r.stdout or '[]')
-        pr_number = str(prs[0]['number']) if prs else ''
+        if pr_r.returncode != 0:
+            print(f"Warning: could not fetch associated PRs: {pr_r.stderr.strip()}")
+            prs = []
+        else:
+            try:
+                prs = json.loads(pr_r.stdout or '[]')
+            except json.JSONDecodeError as e:
+                print(f"Warning: could not parse PR list response: {e}")
+                prs = []
+        # Filter to PRs targeting the release branch to avoid picking the wrong PR
+        # when a commit has been cherry-picked or backported to multiple PRs.
+        matching = [p for p in prs if p.get('base', {}).get('ref') == base_branch]
+        if not matching and prs:
+            print(f"Warning: none of the {len(prs)} associated PR(s) targets '{base_branch}' — "
+                  f"using first PR as fallback. PRs found: {[p['number'] for p in prs]}")
+            matching = prs[:1]
+        pr_number = str(matching[0]['number']) if matching else ''
         print(f'Associated PR: #{pr_number}' if pr_number else 'No associated PR found')
 
         # Build changelog markdown
@@ -315,12 +347,26 @@ runs:
 
         # Post comment on PR if one was found
         if pr_number:
-            subprocess.run([
-                'gh', 'api', '--method', 'POST',
-                f'repos/{repo}/issues/{pr_number}/comments',
-                '-f', f'body={body}',
-            ], env=env, check=True)
-            print(f'Posted proposal comment on PR #{pr_number}')
+            import tempfile
+            from pathlib import Path
+            # delete=False so the path remains valid after close(); finally cleans up.
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            try:
+                json.dump({'body': body}, tmp)
+                tmp.flush()
+                tmp.close()
+                r_comment = subprocess.run([
+                    'gh', 'api', '--method', 'POST',
+                    f'repos/{repo}/issues/{pr_number}/comments',
+                    '--input', tmp.name,
+                ], env=env, capture_output=True, text=True)
+            finally:
+                Path(tmp.name).unlink(missing_ok=True)
+            if r_comment.returncode != 0:
+                print(f'Warning: could not post proposal comment on PR #{pr_number}: '
+                      f'{r_comment.stderr.strip()}')
+            else:
+                print(f'Posted proposal comment on PR #{pr_number}')
         else:
             print('Skipping PR comment — no associated PR for this push')
 
