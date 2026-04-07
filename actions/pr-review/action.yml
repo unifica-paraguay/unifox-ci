@@ -722,3 +722,18 @@ runs:
             '--repo', os.environ['REPO'], '--body', msg,
         ], check=False)
         PYEOF
+
+    - name: Fail if changes requested
+      shell: bash
+      run: |
+        python3 - <<'PYEOF'
+        import json, sys
+        try:
+            verdict = json.load(open('/tmp/review_parsed.json')).get('verdict', 'COMMENT')
+        except FileNotFoundError:
+            sys.exit(0)
+        if verdict == 'CHANGES_REQUESTED':
+            print("Review verdict: CHANGES_REQUESTED — failing check to block merge.")
+            sys.exit(1)
+        print(f"Review verdict: {verdict} — check passes.")
+        PYEOF
