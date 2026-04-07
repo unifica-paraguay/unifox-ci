@@ -1,8 +1,8 @@
 name: "unifox-ci: Release Proposal"
 description: >
   Analyzes commits since the last release tag, asks Claude for the correct
-  semver bump, then opens or updates a GitHub issue with the proposed version,
-  changelog, and /release slash commands.
+  semver bump, posts a proposal comment on the associated PR, and outputs
+  proposed_tag + pr_number for the environment-gated release job.
 
 inputs:
   anthropic_api_key:
@@ -15,7 +15,7 @@ inputs:
     description: "unifox-ci GitHub App private key"
     required: true
   tag_prefix:
-    description: "Tag style: 'semver' (v1.2.3) or 'odoo' (19.0-v1.2.3 branch-scoped)"
+    description: "Tag style: 'semver' (v1.2.3) or 'odoo' (branch-scoped, e.g. 19.0-v1.2.3)"
     required: false
     default: "semver"
   odoo_version:
@@ -26,6 +26,14 @@ inputs:
     description: "Branch being released"
     required: false
     default: "main"
+
+outputs:
+  proposed_tag:
+    description: "Proposed release tag (passed to the release job)"
+    value: ${{ steps.comment.outputs.proposed_tag }}
+  pr_number:
+    description: "PR number associated with this push (empty if none)"
+    value: ${{ steps.comment.outputs.pr_number }}
 
 runs:
   using: "composite"
@@ -38,13 +46,23 @@ runs:
         app-id: ${{ inputs.unifox_app_id }}
         private-key: ${{ inputs.unifox_private_key }}
 
-    - name: Resolve token
+    - name: Require app token
       id: token
       shell: bash
       env:
         APP_TOKEN: ${{ steps.gen-token.outputs.token }}
-        FALLBACK_TOKEN: ${{ github.token }}
-      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+        REPO: ${{ github.repository }}
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "value=${APP_TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Token: using GitHub App (unifox-ci[bot])"
+          exit 0
+        fi
+        ORG="${REPO%%/*}"
+        echo "ERROR: unifox-ci GitHub App is not installed on this repository."
+        echo "Install it at https://github.com/apps/unifox-ci"
+        echo "or enable it for this repository at https://github.com/organizations/${ORG}/settings/installations"
+        exit 1
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -214,35 +232,64 @@ runs:
         print(f"Reasoning:    {data['reasoning']}")
         PYEOF
 
-    - name: Create or update release proposal issue
+    - name: Post PR comment and write outputs
+      id: comment
       shell: bash
       env:
         GH_TOKEN: ${{ steps.token.outputs.value }}
         REPO: ${{ github.repository }}
+        SHA: ${{ github.sha }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        ACTOR: ${{ github.actor }}
         TAG_PREFIX: ${{ inputs.tag_prefix }}
-        ODOO_VERSION: ${{ inputs.odoo_version }}
-        BASE_BRANCH: ${{ inputs.base_branch }}
         LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
         python3 - <<'PYEOF'
-        import json, os, subprocess
+        import json, os, subprocess, sys
 
-        data        = json.load(open('/tmp/release_parsed.json'))
+        try:
+            data = json.load(open('/tmp/release_parsed.json'))
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — 'Ask Claude for version bump' step likely failed.")
+            sys.exit(1)
+
         repo        = os.environ['REPO']
+        sha         = os.environ['SHA']
         run_url     = os.environ['RUN_URL']
-        actor       = os.environ['ACTOR']
         tag_prefix  = os.environ['TAG_PREFIX']
-        odoo_ver    = os.environ['ODOO_VERSION']
-        base_branch = os.environ['BASE_BRANCH']
         last_tag    = os.environ.get('LAST_TAG') or '(none — first release)'
+        base_branch = os.environ.get('BASE_BRANCH', 'main')
         gh_token    = os.environ['GH_TOKEN']
+        env         = {**os.environ, 'GH_TOKEN': gh_token}
 
         new_tag   = data['new_tag']
         bump_type = data['bump_type']
         reasoning = data['reasoning']
-        env       = {**os.environ, 'GH_TOKEN': gh_token}
+
+        # Find PR associated with this commit
+        pr_r = subprocess.run(
+            ['gh', 'api', f'repos/{repo}/commits/{sha}/pulls',
+             '--header', 'Accept: application/vnd.github.v3+json'],
+            capture_output=True, text=True, env=env,
+        )
+        if pr_r.returncode != 0:
+            print(f"Warning: could not fetch associated PRs: {pr_r.stderr.strip()}")
+            prs = []
+        else:
+            try:
+                prs = json.loads(pr_r.stdout or '[]')
+            except json.JSONDecodeError as e:
+                print(f"Warning: could not parse PR list response: {e}")
+                prs = []
+        # Filter to PRs targeting the release branch to avoid picking the wrong PR
+        # when a commit has been cherry-picked or backported to multiple PRs.
+        matching = [p for p in prs if p.get('base', {}).get('ref') == base_branch]
+        if not matching and prs:
+            print(f"Warning: none of the {len(prs)} associated PR(s) targets '{base_branch}' — "
+                  f"using first PR as fallback. PRs found: {[p['number'] for p in prs]}")
+            matching = prs[:1]
+        pr_number = str(matching[0]['number']) if matching else ''
+        print(f'Associated PR: #{pr_number}' if pr_number else 'No associated PR found')
 
         # Build changelog markdown
         changelog_lines = []
@@ -270,79 +317,61 @@ runs:
             except FileNotFoundError:
                 pass
 
-        # Ensure label exists
-        lresult = subprocess.run(
-            ['gh', 'label', 'list', '--repo', repo, '--json', 'name'],
-            capture_output=True, text=True, env=env,
-        )
-        existing_labels = [l['name'] for l in json.loads(lresult.stdout or '[]')]
-        if 'release-proposal' not in existing_labels:
-            subprocess.run([
-                'gh', 'label', 'create', 'release-proposal',
-                '--repo', repo, '--color', '0075ca',
-                '--description', 'Automated release proposal from unifox-ci',
-            ], env=env, check=True)
-            print('Created label: release-proposal')
+        # Build comment body as list to avoid column-1 content in YAML
+        body_parts = [
+            '<!-- unifox-release-proposal -->',
+            '',
+            '\U0001f98a unifox-ci \u2014 Release Proposal',
+            '',
+            f'**Proposed version:** `{new_tag}`  |  **Bump:** {bump_type}  |  **From:** `{last_tag}`',
+            '',
+            f'> {reasoning}',
+            '',
+            '---',
+            '',
+            '## Changelog',
+            '',
+            changelog_md,
+        ]
+        if module_table:
+            body_parts.append(module_table)
+        body_parts += [
+            '',
+            '---',
+            '',
+            f'\u23f3 **Pending approval** \u2014 A maintainer must approve the release'
+            f' in [GitHub Actions]({run_url}) to proceed.',
+            'The release will be created automatically upon approval.',
+        ]
+        body = '\n'.join(body_parts)
 
-        # Build issue body
-        cmds = (
-            f'| `/release confirm` | Create tag `{new_tag}` and publish GitHub Release |\n'
-            f'| `/release cancel` | Close this proposal without releasing |\n'
-            f'| `/release re-analyze` | Re-run analysis (useful after additional merges) |'
-        )
-        body = (
-            f'<!-- release-proposal -->\n'
-            f'<!-- branch: {base_branch} -->\n'
-            f'<!-- proposed-tag: {new_tag} -->\n\n'
-            f'## \U0001f98a unifox-ci \u2014 Release Proposal\n\n'
-            f'**Branch:** `{base_branch}`\n'
-            f'**Current version:** `{last_tag}`\n'
-            f'**Proposed version:** `{new_tag}`\n'
-            f'**Bump type:** {bump_type}\n\n'
-            f'> {reasoning}\n\n'
-            f'---\n\n'
-            f'## Changelog\n\n'
-            f'{changelog_md}\n'
-            f'{module_table}\n'
-            f'---\n\n'
-            f'## Commands\n\n'
-            f'Reply with one of the following commands to proceed:\n\n'
-            f'| Command | Action |\n'
-            f'|---------|--------|\n'
-            f'{cmds}\n\n'
-            f'> \u26a0\ufe0f Only maintainers with write access can execute these commands.\n\n'
-            f'---\n'
-            f'*Proposed by unifox-ci after merge to `{base_branch}` \u2014 [View run]({run_url})*'
-        )
-        title = f'[RELEASE PROPOSAL] {new_tag} \u2014 pending confirmation'
-
-        # Find existing open issue for this branch
-        issues = json.loads(subprocess.run(
-            ['gh', 'issue', 'list', '--repo', repo, '--label', 'release-proposal',
-             '--state', 'open', '--json', 'number,body'],
-            capture_output=True, text=True, env=env,
-        ).stdout or '[]')
-        existing = next(
-            (i for i in issues if f'<!-- branch: {base_branch} -->' in i.get('body', '')),
-            None,
-        )
-
-        if existing:
-            subprocess.run([
-                'gh', 'issue', 'edit', str(existing['number']),
-                '--repo', repo, '--title', title, '--body', body,
-            ], check=True, env=env)
-            print(f"Updated existing proposal issue #{existing['number']}")
-        else:
-            # Try with assignee, fall back without if it fails
-            base_args = [
-                'gh', 'issue', 'create', '--repo', repo,
-                '--title', title, '--body', body, '--label', 'release-proposal',
-            ]
+        # Post comment on PR if one was found
+        if pr_number:
+            import tempfile
+            from pathlib import Path
+            # delete=False so the path remains valid after close(); finally cleans up.
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
             try:
-                r = subprocess.run(base_args + ['--assignee', actor],
-                                   capture_output=True, text=True, check=True, env=env)
-            except subprocess.CalledProcessError:
-                r = subprocess.run(base_args, capture_output=True, text=True, check=True, env=env)
-            print(f"Created new proposal issue: {r.stdout.strip()}")
+                json.dump({'body': body}, tmp)
+                tmp.flush()
+                tmp.close()
+                r_comment = subprocess.run([
+                    'gh', 'api', '--method', 'POST',
+                    f'repos/{repo}/issues/{pr_number}/comments',
+                    '--input', tmp.name,
+                ], env=env, capture_output=True, text=True)
+            finally:
+                Path(tmp.name).unlink(missing_ok=True)
+            if r_comment.returncode != 0:
+                print(f'Warning: could not post proposal comment on PR #{pr_number}: '
+                      f'{r_comment.stderr.strip()}')
+            else:
+                print(f'Posted proposal comment on PR #{pr_number}')
+        else:
+            print('Skipping PR comment — no associated PR for this push')
+
+        # Write action outputs
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'proposed_tag={new_tag}\n')
+            f.write(f'pr_number={pr_number}\n')
         PYEOF

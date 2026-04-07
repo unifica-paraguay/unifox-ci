@@ -38,13 +38,19 @@ runs:
         app-id: ${{ inputs.unifox_app_id }}
         private-key: ${{ inputs.unifox_private_key }}
 
-    - name: Resolve token
+    - name: Require app token
       id: token
       shell: bash
       env:
         APP_TOKEN: ${{ steps.gen-token.outputs.token }}
-        FALLBACK_TOKEN: ${{ github.token }}
-      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "value=${APP_TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Token: using GitHub App (unifox-ci[bot])"
+          exit 0
+        fi
+        echo "ERROR: unifox-ci GitHub App is not installed — install it at https://github.com/apps/unifox-ci"
+        exit 1
 
     - name: Set up Python
       uses: actions/setup-python@v5

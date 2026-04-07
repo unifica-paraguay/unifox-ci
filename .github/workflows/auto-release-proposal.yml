@@ -6,20 +6,150 @@ on:
       - main
 
 jobs:
-  propose-release:
-    name: Propose release
+  propose:
+    name: Analyze and propose release
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
+      pull-requests: write
+    outputs:
+      proposed_tag: ${{ steps.proposal.outputs.proposed_tag }}
+      pr_number: ${{ steps.proposal.outputs.pr_number }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ./actions/release-proposal
+      - id: proposal
+        uses: ./actions/release-proposal
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           tag_prefix: semver
           base_branch: main
+
+  release:
+    name: Create release ${{ needs.propose.outputs.proposed_tag }}
+    needs: propose
+    if: needs.propose.result == 'success' && needs.propose.outputs.proposed_tag != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.propose.outputs.proposed_tag }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Generate bot token
+        id: bot-token
+        # continue-on-error is intentional: the following "Require app token" step
+        # needs to run even when token generation fails (App not installed / wrong credentials)
+        # so it can log actionable install instructions and fail with a clear message.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          private-key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+
+      - name: Require app token
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -n "$BOT_TOKEN" ]; then
+            echo "Token: using GitHub App (unifox-ci[bot])"
+            exit 0
+          fi
+          ORG="${REPO%%/*}"
+          echo "ERROR: unifox-ci GitHub App is not installed on this repository."
+          echo "Install it at https://github.com/apps/unifox-ci"
+          echo "or enable it at https://github.com/organizations/${ORG}/settings/installations"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./actions/release-tag
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          tag_prefix: semver
+          base_branch: main
+          dry_run: "false"
+
+      - name: Update PR comment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          PR_NUMBER: ${{ needs.propose.outputs.pr_number }}
+          PROPOSED_TAG: ${{ needs.propose.outputs.proposed_tag }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          repo      = os.environ['REPO']
+          pr_number = os.environ['PR_NUMBER']
+          run_url   = os.environ['RUN_URL']
+          gh_token  = os.environ['GH_TOKEN']
+          env       = {**os.environ, 'GH_TOKEN': gh_token}
+
+          if not pr_number:
+              print('No PR number — skipping comment update')
+              sys.exit(0)
+
+          # Read the actual tag created by the release-tag step.
+          # Fail loudly if the file is missing — it means release-tag failed
+          # and we must not update the PR comment with a tag that was never released.
+          try:
+              with open('/tmp/release_parsed.json') as f:
+                  tag = json.load(f)['new_tag']
+          except FileNotFoundError:
+              print("ERROR: /tmp/release_parsed.json not found — release-tag step likely failed.")
+              sys.exit(1)
+
+          release_url = f'https://github.com/{repo}/releases/tag/{tag}'
+
+          # Find the proposal comment by its HTML marker
+          comments_r = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/issues/{pr_number}/comments', '--paginate'],
+              capture_output=True, text=True, env=env,
+          )
+          if comments_r.returncode != 0:
+              print(f"Failed to fetch comments: {comments_r.stderr.strip()}")
+              sys.exit(1)
+          try:
+              comments = json.loads(comments_r.stdout or '[]')
+          except json.JSONDecodeError as e:
+              print(f"Failed to parse comments response: {e}")
+              sys.exit(1)
+          proposal = next(
+              (c for c in comments if '<!-- unifox-release-proposal -->' in c.get('body', '')),
+              None,
+          )
+
+          body_parts = [
+              '<!-- unifox-release-proposal -->',
+              '',
+              '\U0001f98a unifox-ci \u2014 Release Published',
+              '',
+              f'\u2705 **[{tag}]({release_url}) was successfully released.**',
+              '',
+              f'Approved and created by unifox-ci \u2014 [View run]({run_url})',
+          ]
+          new_body = '\n'.join(body_parts)
+
+          if proposal:
+              subprocess.run([
+                  'gh', 'api', '--method', 'PATCH',
+                  f"repos/{repo}/issues/comments/{proposal['id']}",
+                  '-f', f'body={new_body}',
+              ], env=env, check=True)
+              print(f"Updated proposal comment on PR #{pr_number}")
+          else:
+              print('Proposal comment not found — skipping update')
+          PYEOF
