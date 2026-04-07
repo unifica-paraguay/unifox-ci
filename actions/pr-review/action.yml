@@ -680,9 +680,23 @@ runs:
             "Output ONLY a valid JSON object (no markdown fences, no explanation outside JSON):",
             '{',
             '  "verdict": "APPROVED" | "CHANGES_REQUESTED" | "COMMENT",',
-            '  "summary": "2-4 sentence summary. If follow-up: mention resolved vs still-pending. Mention warnings and suggestions briefly in prose — do NOT list them as separate comments.",',
+            '  "summary": "ONE sentence — overall assessment only. Is the PR ready? What is it about? Nothing else. Do NOT list individual findings here.",',
             '  "new_comments": [',
-            '    {"path": "file.py", "line": 42, "severity": "critical" | "warning", "body": "Concise issue + why it matters + suggested fix"}',
+            '    {',
+            '      "path": "file.py",',
+            '      "line": 42,',
+            '      "severity": "critical" | "warning",',
+            '      "title": "5-8 word title for the issue table",',
+            '      "body": "Detailed explanation + why it matters + suggested fix (for inline comment)"',
+            '    }',
+            '  ],',
+            '  "suggestions": [',
+            '    {',
+            '      "path": "file.py",',
+            '      "line": 42,',
+            '      "title": "5-8 word title",',
+            '      "body": "Brief note — take it or leave it"',
+            '    }',
             '  ],',
             '  "reply_to": [{"comment_id": 123456, "body": "Reply text", "resolved": true}]',
             '}',
@@ -691,11 +705,14 @@ runs:
             "- verdict=APPROVED: zero pending critical issues AND no new critical issues",
             "- verdict=CHANGES_REQUESTED: one or more critical issues pending or new",
             "- verdict=COMMENT: only warnings / suggestions, nothing critical",
-            "- new_comments: max 5 items, critical and warning severity ONLY",
-            "  Suggestions must go in the summary text, never as inline comments",
+            "- new_comments: max 5 items, CRITICAL and WARNING only.",
+            "  ONLY critical items are posted as GitHub inline comments.",
+            "  Warning items appear in the PR comment summary table — still include path+line.",
+            "- suggestions: take-it-or-leave-it items. NEVER posted inline. Max 3.",
             "- reply_to: one entry per previous pending comment (mandatory)",
+            "- summary: ONE sentence MAX. Do not mention specific files or line numbers here.",
             "- All text in English",
-            "- PR title scope may contain dots, underscores, slashes (e.g. '.github', 'unifica_payment') — do NOT flag these as invalid",
+            "- PR title scope may contain dots, underscores, slashes — do NOT flag these as invalid",
             "- Do not flag TODO comments unless they have been there for multiple PRs",
             "- Do not flag formatting/style that matches the existing codebase convention",
         ]
@@ -746,21 +763,21 @@ runs:
         if data.get('verdict') not in ('APPROVED', 'CHANGES_REQUESTED', 'COMMENT'):
             data['verdict'] = 'COMMENT'
         data.setdefault('new_comments', [])
+        data.setdefault('suggestions', [])
         data.setdefault('reply_to', [])
 
-        # Enforce: suggestions must NOT appear as inline comments.
-        # If Claude accidentally put severity=suggestion as inline, demote it.
-        inline_comments = []
+        # Sanitize new_comments: keep only critical + warning; move anything else to suggestions.
+        # Sort critical first, cap total at 5.
+        clean_comments = []
         for c in data['new_comments']:
             sev = c.get('severity', 'warning')
-            if sev == 'suggestion':
-                # Move to summary (we'll note it in the summary step)
-                continue
-            inline_comments.append(c)
-        # Cap at 5 inline comments — highest severity first
-        SEV_ORDER = {'critical': 0, 'warning': 1}
-        inline_comments.sort(key=lambda c: SEV_ORDER.get(c.get('severity', 'warning'), 1))
-        data['new_comments'] = inline_comments[:5]
+            if sev not in ('critical', 'warning'):
+                data['suggestions'].append(c)
+            else:
+                clean_comments.append(c)
+        clean_comments.sort(key=lambda c: 0 if c.get('severity') == 'critical' else 1)
+        data['new_comments'] = clean_comments[:5]
+        data['suggestions'] = data['suggestions'][:3]
 
         # Re-evaluate verdict: CHANGES_REQUESTED only if there are critical issues
         has_critical = any(c.get('severity') == 'critical' for c in data['new_comments'])
@@ -772,8 +789,10 @@ runs:
         if data['verdict'] == 'CHANGES_REQUESTED' and not has_critical and not pending_critical:
             data['verdict'] = 'COMMENT'
 
+        n_critical = sum(1 for c in data['new_comments'] if c.get('severity') == 'critical')
+        n_warning  = sum(1 for c in data['new_comments'] if c.get('severity') == 'warning')
         json.dump(data, open('/tmp/review_parsed.json', 'w'), indent=2)
-        print(f"Verdict: {data['verdict']}, inline: {len(data['new_comments'])}, reply_to: {len(data['reply_to'])}")
+        print(f"Verdict: {data['verdict']}, critical: {n_critical}, warning: {n_warning}, suggestions: {len(data['suggestions'])}, reply_to: {len(data['reply_to'])}")
         PYEOF
 
     - name: Execute review actions
@@ -924,34 +943,88 @@ runs:
             'COMMENT':           '\U0001f4ac',
         }.get(verdict, '\U0001f4ac')
 
-        # ── Compact header: verdict + counts on one scannable line ─────────────
-        n_critical = sum(1 for c in data.get('new_comments', []) if c.get('severity') == 'critical')
-        n_warning  = sum(1 for c in data.get('new_comments', []) if c.get('severity') == 'warning')
+        # ── Counts ────────────────────────────────────────────────────────────
+        n_critical    = sum(1 for c in data.get('new_comments', []) if c.get('severity') == 'critical')
+        n_warning     = sum(1 for c in data.get('new_comments', []) if c.get('severity') == 'warning')
+        n_suggestions = len(data.get('suggestions', []))
         still_pending = max(0, was_pending - newly_done_count)
         just_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done_count
 
+        # ── Header line ───────────────────────────────────────────────────────
         chips = []
-        if n_critical:
-            chips.append(f'\U0001f534 {n_critical} critical')
-        if n_warning:
-            chips.append(f'\U0001f7e1 {n_warning} warning')
-        if still_pending:
-            chips.append(f'\u21a9\ufe0f {still_pending} pending')
-        if just_resolved:
-            chips.append(f'\u2714\ufe0f {just_resolved} resolved')
+        if n_critical:    chips.append(f'\U0001f534 {n_critical} critical')
+        if n_warning:     chips.append(f'\U0001f7e1 {n_warning} warning')
+        if n_suggestions: chips.append(f'\U0001f4a1 {n_suggestions} suggestion{"s" if n_suggestions > 1 else ""}')
+        if still_pending: chips.append(f'\u21a9\ufe0f {still_pending} pending')
+        if just_resolved: chips.append(f'\u2714\ufe0f {just_resolved} resolved')
         chips_str = ' \u00b7 '.join(chips) if chips else 'no issues'
 
         verdict_label = verdict.replace('_', ' ').title()
         header_line = f'{verdict_icon} **{verdict_label}** \u00b7 {chips_str}'
 
-        rev_body_parts = [
+        # ── Helper: build a 2-col table from a list of finding dicts ─────────
+        def findings_table(items, path_key='path', line_key='line', title_key='title', body_key='body'):
+            rows = ['| File | Issue |', '|------|-------|']
+            for item in items:
+                path  = item.get(path_key, '')
+                line  = item.get(line_key, '')
+                title = item.get(title_key) or item.get(body_key, '')[:60]
+                loc   = f'`{path}:{line}`' if path and line else (f'`{path}`' if path else '—')
+                rows.append(f'| {loc} | {title} |')
+            return '\n'.join(rows)
+
+        # ── Helper: pending comments from context ─────────────────────────────
+        replied_resolved_ids = {
+            r['comment_id'] for r in data.get('reply_to', []) if r.get('resolved')
+        }
+        replied_pending_ids = {
+            r['comment_id'] for r in data.get('reply_to', []) if not r.get('resolved', True)
+        }
+        pending_comments = [
+            c for c in prev
+            if not c['is_resolved'] and c['id'] not in replied_resolved_ids
+        ]
+        resolved_comments = [
+            c for c in prev
+            if c['id'] in replied_resolved_ids
+        ]
+
+        def prev_table(items):
+            rows = ['| File | Issue |', '|------|-------|']
+            for c in items:
+                path = c.get('path', '')
+                line = c.get('line', '')
+                body = c.get('body', '')
+                title = body.split('\n')[0][:70].rstrip()
+                loc   = f'`{path}:{line}`' if path and line else (f'`{path}`' if path else '—')
+                rows.append(f'| {loc} | {title} |')
+            return '\n'.join(rows)
+
+        # ── Assemble body sections ────────────────────────────────────────────
+        body_lines = [
             '<!-- unifox-review -->',
             header_line,
             '',
             data.get('summary', ''),
         ]
 
-        rev_body = '\n'.join(rev_body_parts) + override_note
+        criticals = [c for c in data.get('new_comments', []) if c.get('severity') == 'critical']
+        warnings  = [c for c in data.get('new_comments', []) if c.get('severity') == 'warning']
+        suggs     = data.get('suggestions', [])
+
+        if criticals:
+            body_lines += ['', '\U0001f534 **Critical \u2014 must fix before merge**', findings_table(criticals)]
+        if warnings:
+            body_lines += ['', '\U0001f7e1 **Warnings**', findings_table(warnings)]
+        if pending_comments:
+            body_lines += ['', '\u21a9\ufe0f **Still pending**', prev_table(pending_comments)]
+        if suggs:
+            body_lines += ['', '\U0001f4a1 **Suggestions**', findings_table(suggs)]
+        if resolved_comments:
+            body_lines += ['', f'\u2714\ufe0f **{len(resolved_comments)} resolved in this push**']
+            body_lines.append(prev_table(resolved_comments))
+
+        rev_body = '\n'.join(body_lines) + override_note
 
         event_map = {
             'APPROVED':          'APPROVE',
@@ -960,18 +1033,15 @@ runs:
         }
         event = event_map.get(verdict, 'COMMENT')
 
-        SEV_PREFIX = {
-            'critical':   '\U0001f534 **Critical**',
-            'warning':    '\U0001f7e1 **Warning**',
-            'suggestion': '\U0001f4a1 **Suggestion**',
-        }
+        # Only CRITICAL items are posted as GitHub inline thread comments.
+        # Warnings and suggestions are visible in the structured review body table only.
         inline = []
         for c in data.get('new_comments', []):
+            if c.get('severity') != 'critical':
+                continue
             if not (c.get('path') and isinstance(c.get('line'), int) and c.get('body')):
                 continue
-            sev    = c.get('severity', 'warning')
-            prefix = SEV_PREFIX.get(sev, SEV_PREFIX['warning'])
-            body   = f"{prefix}: {c['body']}"
+            body = f'\U0001f534 **Critical:** {c["body"]}'
             inline.append({'path': c['path'], 'line': c['line'], 'body': body, 'side': 'RIGHT'})
 
         payload = {'commit_id': sha, 'body': rev_body, 'event': event, 'comments': inline}
@@ -981,14 +1051,8 @@ runs:
             # Reuse the same compact header; append an inline-note if needed.
             note = ''
             if inline:
-                note = (f'\n\n_Note: {len(inline)} suggestion(s) could not be attached as '
-                        f'inline comments (line numbers not present in diff)._')
-            fallback_body = '\n'.join([
-                '<!-- unifox-review -->',
-                header_line,
-                '',
-                data.get('summary', '') + note,
-            ])
+                note = f'\n\n_Note: {len(inline)} inline comment(s) could not be attached — line numbers not in diff._'
+            fallback_body = rev_body + note
             payload['comments'] = []
             payload['body'] = fallback_body
             r2 = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')
