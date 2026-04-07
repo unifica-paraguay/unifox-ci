@@ -6,10 +6,9 @@ Run with:  python -m pytest scripts/tests/test_check_commits.py -v
 import sys
 from pathlib import Path
 
-# Make the scripts/ directory importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # noqa: E402
 
-from check_commits import validate_subject
+from check_commits import validate_subject  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
