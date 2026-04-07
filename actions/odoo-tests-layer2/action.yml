@@ -22,6 +22,35 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Load profile config
+      id: profile-cfg
+      shell: bash
+      env:
+        PROFILE: ${{ inputs.profile }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        python3 - <<'PYEOF'
+        import os
+        profile = os.environ.get('PROFILE', 'odoo')
+        path = os.path.join(os.environ['ACTION_PATH'], '../../profiles', f'{profile}.yml')
+        cfg = {}
+        try:
+            for line in open(path):
+                line = line.strip()
+                if line.startswith('#') or ':' not in line:
+                    continue
+                k, _, v = line.partition(':')
+                v = v.strip().strip('"').strip("'")
+                if v and v != 'null':
+                    cfg[k.strip()] = v
+        except FileNotFoundError:
+            pass
+        odoo_image = cfg.get('odoo_image', 'odoo:19')
+        print(f"Profile {profile}: odoo={odoo_image}")
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"odoo_image={odoo_image}\n")
+        PYEOF
+
     - name: Detect modified modules
       id: detect
       shell: bash
@@ -74,7 +103,7 @@ runs:
     - name: Pull Odoo image
       if: steps.deps.outputs.native_deps != '' && steps.detect.outputs.modules != ''
       shell: bash
-      run: docker pull odoo:19 || true
+      run: docker pull ${{ steps.profile-cfg.outputs.odoo_image }} || true
 
     - name: Start PostgreSQL
       if: steps.deps.outputs.native_deps != '' && steps.detect.outputs.modules != ''

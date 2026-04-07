@@ -7,12 +7,19 @@ Usage:
 
 The script builds a system prompt from:
   1. CLAUDE.md in the calling repo's cwd (if present)
-  2. coding_guidelines.rst from unifox-ci/context/
-  3. git_guidelines.rst from unifox-ci/context/
+  2. Profile-specific guidelines from unifox-ci/context/
+     - UNIFOX_PROFILE=odoo   → coding_guidelines.rst + git_guidelines.rst
+     - UNIFOX_PROFILE=react  → js_guidelines.md + git_guidelines.rst
+     - UNIFOX_PROFILE=astro  → js_guidelines.md + git_guidelines.rst
+     - UNIFOX_PROFILE=node   → js_guidelines.md + git_guidelines.rst
+     - UNIFOX_PROFILE=python → git_guidelines.rst
+     - default               → git_guidelines.rst only
 
 Environment variables:
-    ANTHROPIC_API_KEY   required
-    CLAUDE_MODEL        optional, defaults to claude-sonnet-4-6
+    ANTHROPIC_API_KEY          required
+    CLAUDE_MODEL               optional, defaults to claude-sonnet-4-6
+    UNIFOX_PROFILE             optional, profile name for context selection
+    UNIFOX_LOAD_DOC_GUIDELINES set to '1' to also load Odoo documentation guidelines
 """
 
 import os
@@ -29,20 +36,30 @@ except ImportError:
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 API_URL = "https://api.anthropic.com/v1/messages"
 MAX_RETRIES = 3
-TIMEOUT = 60
+TIMEOUT = 90  # increased for large context prompts
 
 # ---------------------------------------------------------------------------
 # Load system prompt
 # ---------------------------------------------------------------------------
 
 
+def _append_git_guidelines(parts: list, context_dir: "Path") -> None:
+    git_gl = context_dir / "git_guidelines.rst"
+    if git_gl.exists():
+        parts.append(
+            "\n=== Git / commit guidelines ===\n\n"
+            + git_gl.read_text(encoding="utf-8")
+        )
+
+
 def _load_system_prompt() -> str:
     # scripts/ lives one level below the unifox-ci repo root
     unifox_root = Path(__file__).resolve().parent.parent
     context_dir = unifox_root / "context"
+    profile = os.environ.get("UNIFOX_PROFILE", "").lower()
 
-    parts = [
-        "You are a code reviewer and automation assistant.\n"
+    parts: list[str] = [
+        "You are a code reviewer and automation assistant for the Unifica Paraguay engineering team.\n"
     ]
 
     # 1. Repo-specific conventions — CLAUDE.md from the calling workspace (cwd)
@@ -53,33 +70,44 @@ def _load_system_prompt() -> str:
             + caller_claude.read_text(encoding="utf-8")
         )
 
-    # 2. Odoo coding guidelines (Python, XML, JS, SCSS)
-    coding = context_dir / "coding_guidelines.rst"
-    if coding.exists():
-        parts.append(
-            "\n=== Odoo coding guidelines ===\n\n"
-            + coding.read_text(encoding="utf-8")
-        )
+    # 2. Profile-specific guidelines
+    #
+    # Odoo profile: full coding guidelines + git guidelines
+    if profile == "odoo":
+        coding = context_dir / "coding_guidelines.rst"
+        if coding.exists():
+            parts.append(
+                "\n=== Odoo coding guidelines ===\n\n"
+                + coding.read_text(encoding="utf-8")
+            )
+        _append_git_guidelines(parts, context_dir)
+        # Optional doc guidelines
+        if os.environ.get("UNIFOX_LOAD_DOC_GUIDELINES") == "1":
+            for fname in ("content_guidelines.rst", "rst_guidelines.rst"):
+                path = context_dir / fname
+                if path.exists():
+                    parts.append(
+                        f"\n=== Odoo {fname} ===\n\n"
+                        + path.read_text(encoding="utf-8")
+                    )
 
-    # 3. Odoo git / commit guidelines
-    git_gl = context_dir / "git_guidelines.rst"
-    if git_gl.exists():
-        parts.append(
-            "\n=== Odoo git guidelines ===\n\n"
-            + git_gl.read_text(encoding="utf-8")
-        )
+    # JS/TS profiles: JS guidelines + git guidelines
+    elif profile in ("react", "astro", "node"):
+        js_gl = context_dir / "js_guidelines.md"
+        if js_gl.exists():
+            parts.append(
+                "\n=== JavaScript / TypeScript / React guidelines ===\n\n"
+                + js_gl.read_text(encoding="utf-8")
+            )
+        _append_git_guidelines(parts, context_dir)
 
-    # 4. Documentation guidelines are available in context/ but not loaded by
-    #    default to keep context size manageable. Load them conditionally when
-    #    the UNIFOX_LOAD_DOC_GUIDELINES=1 env var is set.
-    if os.environ.get("UNIFOX_LOAD_DOC_GUIDELINES") == "1":
-        for fname in ("content_guidelines.rst", "rst_guidelines.rst"):
-            path = context_dir / fname
-            if path.exists():
-                parts.append(
-                    f"\n=== Odoo {fname} ===\n\n"
-                    + path.read_text(encoding="utf-8")
-                )
+    # Python non-Odoo: just git guidelines (Python best practices are in the prompt)
+    elif profile == "python":
+        _append_git_guidelines(parts, context_dir)
+
+    # Default / unknown: git guidelines only
+    else:
+        _append_git_guidelines(parts, context_dir)
 
     return "\n\n".join(parts)
 
@@ -88,7 +116,7 @@ def _load_system_prompt() -> str:
 # API call with retry / backoff
 # ---------------------------------------------------------------------------
 
-def call_claude(prompt: str, max_tokens: int = 4096) -> str:
+def call_claude(prompt: str, max_tokens: int = 8192) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)

@@ -1,0 +1,60 @@
+# unifox-ci profile: astro
+# Rules for Astro (v3/v4) repositories (content sites, marketing, portals).
+
+name: astro
+description: "Profile for Astro repositories"
+
+guidelines:
+  - git_guidelines.rst
+  - js_guidelines.md
+
+branch_pattern: ".*"
+branch_hint: "No specific branch naming convention enforced"
+
+module_manifest: null
+module_prefix: null
+
+version_format: "semver"
+
+linters:
+  - eslint
+  - tsc
+
+test_runner: node
+test_command: "npm test -- --passWithNoTests"
+test_command_pnpm: "pnpm test -- --passWithNoTests"
+test_command_yarn: "yarn test --passWithNoTests"
+
+diff_patterns:
+  - "*.astro"
+  - "*.ts"
+  - "*.tsx"
+  - "*.js"
+  - "*.jsx"
+  - "*.css"
+  - "*.scss"
+  - "*.md"
+  - "*.mdx"
+  - "*.json"
+
+diff_exclude:
+  - "node_modules/*"
+  - "dist/*"
+  - ".astro/*"
+  - "*.min.js"
+  - "*.lock"
+  - "package-lock.json"
+  - "pnpm-lock.yaml"
+
+review_focus:
+  - "Astro component frontmatter: imports and variables must be valid JS/TS"
+  - "No client-side JS in server-only components without client:* directive"
+  - "Correct use of client:load / client:idle / client:visible for interactive islands"
+  - "Content collections: validate schema matches actual frontmatter fields"
+  - "No console.log / debugger left in production code"
+  - "Image optimization: use Astro's built-in <Image> component"
+  - "Accessibility: interactive elements must have ARIA labels or visible text"
+  - "TypeScript: all props and data shapes must be typed"
+  - "Security: no set:html with unsanitized user input"
+  - "Performance: avoid unnecessary client-side hydration"
+  - "Routing: dynamic routes must have getStaticPaths when using SSG mode"

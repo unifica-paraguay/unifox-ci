@@ -1,0 +1,268 @@
+name: "[Reusable] Auto Version & Release"
+
+# AI-driven semantic versioning for any repo in the org.
+#
+# Strategy auto-detection:
+#   • Branch matches N.N (e.g. 19.0, 18.0)  → Odoo style: 19.0-v1.2.3
+#   • profile: odoo + any branch             → Odoo style (infers version from branch or tag history)
+#   • Everything else                        → semver: v1.2.3
+#
+# Floating tags always maintained:
+#   semver → v1 (major), latest
+#   odoo   → 19.0-v1 (major), 19.0-latest (per-branch latest)
+#
+# Usage — add to your repo's workflow:
+#
+#   on:
+#     push:
+#       branches: [main]          # non-Odoo repos
+#       # — or —
+#       branches: ['19.0']        # Odoo repos: one workflow per supported major
+#
+#   jobs:
+#     version:
+#       uses: unifica-paraguay/unifox-ci/.github/workflows/reusable-auto-version.yml@v1
+#       with:
+#         profile: auto           # or explicit: odoo | default | react | python | node | astro
+#       secrets: inherit
+#
+# Approval gate:
+#   Claude proposes the version bump and posts a comment on the associated PR.
+#   A maintainer approves the "release" environment in GitHub Actions.
+#   Only then are the tags and GitHub Release created.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Repo profile — used to determine versioning strategy (auto | odoo | default | ...)"
+        type: string
+        default: "auto"
+      base_branch:
+        description: "Branch being released (defaults to the branch that triggered the workflow)"
+        type: string
+        default: ""
+      dry_run:
+        description: "Preview the proposed version without creating tags or releases"
+        type: boolean
+        default: false
+    outputs:
+      new_tag:
+        description: "Tag created (e.g. v1.2.3 or 19.0-v1.2.3)"
+        value: ${{ jobs.release.outputs.new_tag }}
+      release_url:
+        description: "URL of the published GitHub Release"
+        value: ${{ jobs.release.outputs.release_url }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Detect versioning strategy from branch name and profile
+  # ---------------------------------------------------------------------------
+  detect:
+    name: Detect versioning strategy
+    runs-on: ubuntu-latest
+    outputs:
+      tag_prefix:   ${{ steps.detect.outputs.tag_prefix }}
+      odoo_version: ${{ steps.detect.outputs.odoo_version }}
+      base_branch:  ${{ steps.detect.outputs.base_branch }}
+    steps:
+      - id: detect
+        shell: bash
+        env:
+          PROFILE:     ${{ inputs.profile }}
+          BASE_BRANCH: ${{ inputs.base_branch || github.ref_name }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, re
+
+          profile = os.environ.get('PROFILE', 'auto').lower()
+          branch  = os.environ.get('BASE_BRANCH', '').strip() or 'main'
+
+          # Odoo branches look like "19.0", "18.0", "20.0"
+          odoo_branch_re = re.compile(r'^(\d+)\.(\d+)$')
+          m = odoo_branch_re.match(branch)
+
+          if profile == 'odoo' or m:
+              tag_prefix = 'odoo'
+              if m:
+                  odoo_version = branch          # e.g. "19.0"
+              else:
+                  # profile=odoo but branch is main/etc — try to infer from existing tags
+                  odoo_version = ''              # release-tag will use tag history
+          else:
+              tag_prefix   = 'semver'
+              odoo_version = ''
+
+          print(f"Branch: {branch}  →  tag_prefix={tag_prefix}, odoo_version={odoo_version!r}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"tag_prefix={tag_prefix}\n")
+              f.write(f"odoo_version={odoo_version}\n")
+              f.write(f"base_branch={branch}\n")
+          PYEOF
+
+  # ---------------------------------------------------------------------------
+  # Claude analyzes commits → proposes version bump → posts PR comment
+  # ---------------------------------------------------------------------------
+  propose:
+    name: Propose version bump
+    needs: detect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      proposed_tag: ${{ steps.proposal.outputs.proposed_tag }}
+      pr_number:    ${{ steps.proposal.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: proposal
+        uses: unifica-paraguay/unifox-ci/actions/release-proposal@claude/improve-bot-testing-q5hXf
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id:     ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          tag_prefix:   ${{ needs.detect.outputs.tag_prefix }}
+          odoo_version: ${{ needs.detect.outputs.odoo_version }}
+          base_branch:  ${{ needs.detect.outputs.base_branch }}
+
+  # ---------------------------------------------------------------------------
+  # Human approval gate (GitHub environment: "release")
+  # Creates tags + GitHub Release only after a maintainer approves
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release ${{ needs.propose.outputs.proposed_tag }}
+    needs: [detect, propose]
+    if: needs.propose.outputs.proposed_tag != '' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: ${{ steps.tag.outputs.release_url }}
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      new_tag:     ${{ needs.propose.outputs.proposed_tag }}
+      release_url: ${{ steps.tag.outputs.release_url }}
+    steps:
+      - name: Generate bot token
+        id: bot-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          private-key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+
+      - name: Require app token
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -n "$BOT_TOKEN" ]; then
+            echo "Token: using GitHub App (unifox-ci[bot])"
+            exit 0
+          fi
+          ORG="${REPO%%/*}"
+          echo "::error title=unifox-ci not installed::Install the unifox-ci GitHub App at https://github.com/apps/unifox-ci or enable it at https://github.com/organizations/${ORG}/settings/installations"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.bot-token.outputs.token }}
+
+      - id: tag
+        uses: unifica-paraguay/unifox-ci/actions/release-tag@claude/improve-bot-testing-q5hXf
+        with:
+          anthropic_api_key:  ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id:      ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          tag_prefix:   ${{ needs.detect.outputs.tag_prefix }}
+          odoo_version: ${{ needs.detect.outputs.odoo_version }}
+          base_branch:  ${{ needs.detect.outputs.base_branch }}
+          dry_run:      "false"
+
+      - name: Update proposal comment
+        if: needs.propose.outputs.pr_number != ''
+        shell: bash
+        env:
+          GH_TOKEN:     ${{ steps.bot-token.outputs.token }}
+          PR_NUMBER:    ${{ needs.propose.outputs.pr_number }}
+          NEW_TAG:      ${{ needs.propose.outputs.proposed_tag }}
+          RELEASE_URL:  ${{ steps.tag.outputs.release_url }}
+          REPO:         ${{ github.repository }}
+          RUN_URL:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess
+
+          repo        = os.environ['REPO']
+          pr_number   = os.environ['PR_NUMBER']
+          new_tag     = os.environ['NEW_TAG']
+          release_url = os.environ['RELEASE_URL']
+          run_url     = os.environ['RUN_URL']
+
+          # Find the proposal comment to update
+          r = subprocess.run(
+              ['gh', 'api', f'repos/{repo}/issues/{pr_number}/comments', '--paginate'],
+              capture_output=True, text=True,
+          )
+          comments = json.loads(r.stdout or '[]')
+          proposal = next(
+              (c for c in comments if '<!-- unifox-release-proposal -->' in c.get('body', '')),
+              None,
+          )
+
+          body = '\n'.join([
+              '<!-- unifox-release-proposal -->',
+              '',
+              '\U0001f98a unifox-ci \u2014 Release Published',
+              '',
+              f'\u2705 **[{new_tag}]({release_url}) was successfully released.**',
+              '',
+              f'_Approved and created by unifox-ci \u2014 [View run]({run_url})_',
+          ])
+
+          if proposal:
+              subprocess.run([
+                  'gh', 'api', '--method', 'PATCH',
+                  f"repos/{repo}/issues/comments/{proposal['id']}",
+                  '-f', f'body={body}',
+              ], check=False)
+              print(f"Updated proposal comment on PR #{pr_number}")
+          PYEOF
+
+  # ---------------------------------------------------------------------------
+  # Dry-run summary (no tags created, just shows what would happen)
+  # ---------------------------------------------------------------------------
+  dry-run-summary:
+    name: Dry run — proposed ${{ needs.propose.outputs.proposed_tag }}
+    needs: [detect, propose]
+    if: inputs.dry_run && needs.propose.outputs.proposed_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        env:
+          PROPOSED_TAG: ${{ needs.propose.outputs.proposed_tag }}
+          TAG_PREFIX:   ${{ needs.detect.outputs.tag_prefix }}
+          ODOO_VERSION: ${{ needs.detect.outputs.odoo_version }}
+          BASE_BRANCH:  ${{ needs.detect.outputs.base_branch }}
+        run: |
+          {
+            echo "## 🔍 Dry run — versioning preview"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Proposed tag** | \`${PROPOSED_TAG}\` |"
+            echo "| **Strategy** | \`${TAG_PREFIX}\` |"
+            if [ -n "$ODOO_VERSION" ]; then
+              echo "| **Odoo branch** | \`${ODOO_VERSION}\` |"
+            fi
+            echo "| **Base branch** | \`${BASE_BRANCH}\` |"
+            echo ""
+            echo "_No tags or releases were created. Remove \`dry_run: true\` to publish._"
+          } >> "$GITHUB_STEP_SUMMARY"

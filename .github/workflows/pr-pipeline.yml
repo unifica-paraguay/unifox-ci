@@ -10,8 +10,9 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write    # needed by version-bump job (commits to PR branch)
   pull-requests: write
+  issues: write
 
 jobs:
   ai-enrich:

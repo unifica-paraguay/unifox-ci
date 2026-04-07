@@ -1,0 +1,362 @@
+name: "unifox-ci: PR Security Scan"
+description: >
+  Fast pattern-based security scan on changed files. Detects:
+  hardcoded secrets/tokens/passwords, SQL string interpolation,
+  dangerous eval/exec usage, debug code left in production,
+  and known insecure patterns. Posts a summary comment and blocks
+  merge on confirmed critical findings.
+
+inputs:
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  base_branch:
+    description: "Base branch of the repository"
+    required: false
+    default: "main"
+  fail_on_critical:
+    description: "Exit with failure if critical secrets are found"
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate app token
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Run security scan
+      id: scan
+      continue-on-error: true
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+        FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, re, subprocess, sys
+        from pathlib import Path
+
+        base             = os.environ['BASE_BRANCH']
+        fail_on_critical = os.environ.get('FAIL_ON_CRITICAL', 'true').lower() == 'true'
+
+        # ------------------------------------------------------------------ #
+        # Pattern definitions
+        # ------------------------------------------------------------------ #
+        # Each entry: (regex, severity, label, false_positive_filter)
+        #   severity: 'critical' | 'warning' | 'info'
+        #   false_positive_filter: optional regex — if it matches the line,
+        #                          the finding is suppressed (e.g. example/placeholder)
+
+        PATTERNS = [
+            # --- Hardcoded secrets ---
+            (
+                r'(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[=:]\s*["\'](?!{)[A-Za-z0-9+/\-_]{16,}["\']',
+                'critical', 'Hardcoded API key / secret token',
+                r'(?i)(example|placeholder|your[_-]?key|changeme|fake|test|dummy|xxxx|replace)',
+            ),
+            (
+                r'(?i)password\s*[=:]\s*["\'](?!{).{4,}["\']',
+                'critical', 'Hardcoded password',
+                r'(?i)(example|placeholder|changeme|fake|test|dummy|xxxx|replace|empty|none|null|"")',
+            ),
+            (
+                r'(?i)(private[_-]?key|client[_-]?secret|aws[_-]?secret|stripe[_-]?secret)\s*[=:]\s*["\'](?!{)[A-Za-z0-9+/\-_]{8,}["\']',
+                'critical', 'Hardcoded private key / client secret',
+                r'(?i)(example|placeholder|your[_-]?|changeme|fake|test|dummy|xxxx)',
+            ),
+            # PEM keys
+            (
+                r'-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----',
+                'critical', 'PEM private key embedded in source',
+                None,
+            ),
+            # --- SQL injection ---
+            (
+                # %-format strings passed directly to execute/query
+                r'(?i)(query|execute|cursor\.execute)\s*\(\s*["\'][^"\']*%[sd][^"\']*["\']',
+                'critical', 'Potential SQL injection (%-format string in query call)',
+                r'(?i)(parameterized|placeholder|\?|%s.*params|bind)',
+            ),
+            (
+                # f-strings whose FIRST token is a SQL keyword (e.g. f"SELECT {x}")
+                r'(?i)f["\'][\s]*(SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b',
+                'critical', 'Potential SQL injection (f-string starting with SQL keyword)',
+                r'(?i)(parameterized|placeholder|safe|escaped)',
+            ),
+            (
+                r'\.execute\([^,\)]*\+',
+                'warning', 'String concatenation in .execute() — possible SQL injection',
+                None,
+            ),
+            # --- Dangerous eval/exec ---
+            (
+                r'\beval\s*\(',
+                'critical', 'Use of eval() — potential code injection',
+                # Skip: commented-out, safe_eval wrapper, tests, or the word inside a string
+                r'(?i)(#.*\beval\b|safe_eval|test|spec|example|["\'][^"\']*\beval\b[^"\']*["\'])',
+            ),
+            (
+                r'\bexec\s*\(',
+                'warning', 'Use of exec() — review if input is trusted',
+                r'(?i)(#.*\bexec\b|subprocess|test|spec|["\'][^"\']*\bexec\b[^"\']*["\'])',
+            ),
+            # --- Debug code ---
+            (
+                r'\bconsole\.(log|debug|info)\s*\(',
+                'warning', 'console.log/debug left in production code',
+                r'(?i)(test|spec|\.test\.|\.spec\.|__test__|logger|log\.)',
+            ),
+            (
+                # Only flag standalone `debugger` statement (as its own token on the line)
+                r'^\s*debugger\s*;?\s*$',
+                'critical', 'debugger statement left in production code',
+                r'(?i)(test|spec)',
+            ),
+            (
+                r'^\s*breakpoint\s*\(\s*\)\s*;?\s*$',
+                'critical', 'breakpoint() left in production code',
+                r'(?i)(test|spec)',
+            ),
+            (
+                r'^\s*pdb\.set_trace\s*\(\s*\)\s*$',
+                'critical', 'pdb.set_trace() left in production code',
+                r'(?i)(test|spec)',
+            ),
+            # --- Insecure patterns ---
+            (
+                r'(?i)dangerouslySetInnerHTML\s*=\s*\{\s*\{',
+                'warning', 'dangerouslySetInnerHTML — verify input is sanitized',
+                r'(?i)(sanitize|DOMPurify|xss)',
+            ),
+            (
+                r'(?i)subprocess\.(call|run|Popen)\([^)]*shell\s*=\s*True',
+                'critical', 'subprocess with shell=True — command injection risk',
+                r'(?i)(test|spec|# safe|trusted)',
+            ),
+            (
+                r'(?i)(md5|sha1)\s*\(',
+                'info', 'Weak hash function (MD5/SHA1) — avoid for passwords/security',
+                r'(?i)(checksum|fingerprint|etag|test|spec|legacy|#)',
+            ),
+            (
+                r'(?i)verify\s*=\s*False',
+                'warning', 'SSL certificate verification disabled',
+                r'(?i)(test|dev|local|#)',
+            ),
+            (
+                r'(?i)(CORS|cors).*\*',
+                'warning', 'Wildcard CORS origin — verify this is intentional',
+                r'(?i)(test|dev|local|#)',
+            ),
+        ]
+
+        # ------------------------------------------------------------------ #
+        # Scan changed files
+        # ------------------------------------------------------------------ #
+        result = subprocess.run(
+            ['git', 'diff', '--diff-filter=AM', '--name-only', f'origin/{base}...HEAD'],
+            capture_output=True, text=True,
+        )
+        changed_files = [f for f in result.stdout.strip().splitlines() if f and Path(f).exists()]
+
+        # Skip generated / binary / lock files
+        SKIP_DIRS  = {'node_modules', 'dist', 'build', '.next', '.astro', '__pycache__', '.venv', 'venv'}
+        SKIP_EXTS  = {'.lock', '.pyc', '.min.js', '.map', '.png', '.jpg', '.gif', '.svg', '.woff', '.ttf',
+                      '.yml', '.yaml',   # CI/config files — not production code
+                      '.md', '.rst'}     # documentation files
+        SKIP_NAMES = {'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
+
+        findings = []  # list of dicts: file, line, severity, label, snippet
+
+        for fpath in changed_files:
+            p = Path(fpath)
+            if p.name in SKIP_NAMES:
+                continue
+            if p.suffix.lower() in SKIP_EXTS:
+                continue
+            if set(p.parts) & SKIP_DIRS:
+                continue
+
+            try:
+                lines = p.read_text(errors='replace').splitlines()
+            except Exception:
+                continue
+
+            for lineno, line in enumerate(lines, 1):
+                # Skip comment-only lines (heuristic)
+                stripped = line.strip()
+                if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('*'):
+                    continue
+
+                for pattern, severity, label, fp_filter in PATTERNS:
+                    if re.search(pattern, line):
+                        if fp_filter and re.search(fp_filter, line):
+                            continue  # false positive — skip
+                        findings.append({
+                            'file':     fpath,
+                            'line':     lineno,
+                            'severity': severity,
+                            'label':    label,
+                            'snippet':  line.strip()[:120],
+                        })
+                        break  # one finding per line
+
+        # ------------------------------------------------------------------ #
+        # Write results
+        # ------------------------------------------------------------------ #
+        critical = [f for f in findings if f['severity'] == 'critical']
+        warnings = [f for f in findings if f['severity'] == 'warning']
+        infos    = [f for f in findings if f['severity'] == 'info']
+
+        summary = {
+            'critical_count': len(critical),
+            'warning_count':  len(warnings),
+            'info_count':     len(infos),
+            'findings':       findings,
+        }
+        json.dump(summary, open('/tmp/security_scan.json', 'w'), indent=2)
+
+        print(f"Security scan: {len(findings)} finding(s) — "
+              f"{len(critical)} critical, {len(warnings)} warnings, {len(infos)} info")
+
+        if fail_on_critical and critical:
+            print(f"\nCritical findings that must be resolved:")
+            for f in critical:
+                print(f"  {f['file']}:{f['line']} — {f['label']}")
+                print(f"    {f['snippet']}")
+            sys.exit(1)
+
+        PYEOF
+
+    - name: Find existing security scan comment
+      if: always()
+      id: find-comment
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        COMMENT_ID=$(gh api \
+          "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+          --jq '[.[] | select(.body | contains("<!-- unifox-security-scan -->"))] | last | .id // ""')
+        echo "comment_id=${COMMENT_ID}" >> "$GITHUB_OUTPUT"
+
+    - name: Post security scan comment
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        EXISTING_COMMENT_ID: ${{ steps.find-comment.outputs.comment_id }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        SCAN_OUTCOME: ${{ steps.scan.outcome }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess
+        from datetime import datetime, timezone
+
+        existing = os.environ['EXISTING_COMMENT_ID'].strip()
+        repo     = os.environ['REPO']
+        pr       = os.environ['PR_NUMBER']
+        run_url  = os.environ['RUN_URL']
+        outcome  = os.environ.get('SCAN_OUTCOME', 'success')
+        ts       = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        try:
+            summary = json.load(open('/tmp/security_scan.json'))
+        except Exception:
+            summary = {'critical_count': 0, 'warning_count': 0, 'info_count': 0, 'findings': []}
+
+        findings  = summary.get('findings', [])
+        critical  = [f for f in findings if f['severity'] == 'critical']
+        warnings  = [f for f in findings if f['severity'] == 'warning']
+        infos     = [f for f in findings if f['severity'] == 'info']
+
+        if not findings:
+            overall = '\u2705 No security issues found'
+        elif critical:
+            overall = f'\U0001f6a8 {len(critical)} critical security issue(s) found'
+        else:
+            overall = f'\u26a0\ufe0f {len(warnings)} warning(s) found'
+
+        parts = ['<!-- unifox-security-scan -->', f'## \U0001f512 Security Scan', '', f'**{overall}**', '']
+
+        if critical:
+            parts += ['<details>', f'<summary>\U0001f534 Critical ({len(critical)})</summary>', '']
+            for f in critical[:10]:
+                parts.append(f'- `{f["file"]}:{f["line"]}` — **{f["label"]}**')
+                parts.append(f'  ```')
+                parts.append(f'  {f["snippet"]}')
+                parts.append(f'  ```')
+            parts += ['', '</details>', '']
+
+        if warnings:
+            parts += ['<details>', f'<summary>\U0001f7e1 Warnings ({len(warnings)})</summary>', '']
+            for f in warnings[:10]:
+                parts.append(f'- `{f["file"]}:{f["line"]}` — {f["label"]}')
+            parts += ['', '</details>', '']
+
+        if infos:
+            parts += ['<details>', f'<summary>\U0001f4ac Info ({len(infos)})</summary>', '']
+            for f in infos[:5]:
+                parts.append(f'- `{f["file"]}:{f["line"]}` — {f["label"]}')
+            parts += ['', '</details>', '']
+
+        parts += ['---', f'_Scanned: {ts} \u2014 [View full log]({run_url})_']
+
+        body = '\n'.join(parts)
+        open('/tmp/security-comment.md', 'w').write(body)
+
+        if existing and existing != 'null':
+            r = subprocess.run([
+                'gh', 'api', '--method', 'PATCH',
+                f'repos/{repo}/issues/comments/{existing}',
+                '--field', 'body=@/tmp/security-comment.md',
+            ], capture_output=True, text=True)
+        else:
+            r = subprocess.run([
+                'gh', 'pr', 'comment', pr, '--repo', repo,
+                '--body-file', '/tmp/security-comment.md',
+            ], capture_output=True, text=True)
+
+        if r.returncode != 0:
+            print(r.stderr)
+        print('Security comment', 'updated' if existing and existing != 'null' else 'posted')
+        PYEOF
+
+    - name: Fail if critical findings
+      if: always()
+      shell: bash
+      env:
+        SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+      run: |
+        if [ "$FAIL_ON_CRITICAL" = "true" ] && [ "$SCAN_OUTCOME" = "failure" ]; then
+          echo "Security scan found critical issues — blocking merge."
+          exit 1
+        fi
+        exit 0

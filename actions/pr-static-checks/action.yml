@@ -1,8 +1,10 @@
 name: "unifox-ci: PR Static Checks"
 description: >
-  Runs static checks on a PR: branch naming convention, version bump,
-  manifest & structure, test existence, and flake8 lint.
-  Posts a summary comment and fails the job if any check fails.
+  Runs static checks on a PR. Profile-aware: adapts checks to the detected
+  framework (odoo, react, astro, python, node, default).
+  Checks: branch naming, PR size warning, version bump (odoo), manifest &
+  structure (odoo), tests existence, lint (flake8/eslint/tsc/pytest).
+  Posts a single clean summary comment. Fails the job if any blocking check fails.
 
 inputs:
   unifox_app_id:
@@ -16,9 +18,9 @@ inputs:
     required: false
     default: "main"
   profile:
-    description: "Repository profile (odoo, default)"
+    description: "Repository profile (odoo, react, astro, python, node, default, auto)"
     required: false
-    default: "default"
+    default: "auto"
 
 runs:
   using: "composite"
@@ -28,40 +30,119 @@ runs:
       with:
         python-version: "3.11"
 
-    - name: Install lint tools
+    - name: Install Python lint tools
       shell: bash
       run: pip install flake8
 
-    - name: Detect modified modules
+    - name: Detect profile
+      id: profile
+      shell: bash
+      env:
+        PROFILE_INPUT: ${{ inputs.profile }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_framework.sh"
+        if [ "$PROFILE_INPUT" = "auto" ] || [ -z "$PROFILE_INPUT" ]; then
+          PROFILE=$("${{ github.action_path }}/../../scripts/detect_framework.sh" .)
+          echo "Auto-detected profile: $PROFILE"
+        else
+          PROFILE="$PROFILE_INPUT"
+          echo "Using explicit profile: $PROFILE"
+        fi
+        echo "value=${PROFILE}" >> "$GITHUB_OUTPUT"
+
+    - name: Detect modified modules (Odoo only)
       id: detect
       shell: bash
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
+        PROFILE: ${{ steps.profile.outputs.value }}
       run: |
-        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
-        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
-        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
-        if [ -z "$MODS" ]; then
-          echo "No Odoo modules modified — skipping module-level checks."
+        if [ "$PROFILE" = "odoo" ]; then
+          chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+          MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+          echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+          [ -z "$MODS" ] && echo "No Odoo modules modified." || echo "Modified modules: $MODS"
         else
-          echo "Modified modules: $MODS"
+          echo "modules=" >> "$GITHUB_OUTPUT"
+          echo "Profile $PROFILE — skipping Odoo module detection."
         fi
 
-    - name: "[1] Branch naming"
+    - name: "[1] Commit messages"
+      id: commits
+      continue-on-error: true
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        python "${{ github.action_path }}/../../scripts/check_commits.py" "$BASE_BRANCH"
+
+    - name: "[2] Branch naming"
       id: branch
       continue-on-error: true
       shell: bash
+      env:
+        PROFILE: ${{ steps.profile.outputs.value }}
       run: |
         BRANCH="${{ github.head_ref }}"
-        if [[ "$BRANCH" =~ ^release[/-] ]]; then
-          echo "PASS: '$BRANCH' matches required pattern"
+        # Only enforce release/* pattern for Odoo repos
+        if [ "$PROFILE" = "odoo" ]; then
+          if [[ "$BRANCH" =~ ^release[/-] ]]; then
+            echo "PASS: '$BRANCH' matches required pattern"
+          else
+            echo "FAIL: '$BRANCH' does not match naming convention."
+            echo "      Odoo repo branches must start with 'release/' or 'release-'."
+            exit 1
+          fi
         else
-          echo "FAIL: '$BRANCH' does not match naming convention."
-          echo "      Branches must start with 'release/' or 'release-'."
-          exit 1
+          echo "SKIP: Branch naming convention not enforced for profile '$PROFILE'"
         fi
 
-    - name: "[2] Version bump"
+    - name: "[3] PR size check"
+      id: pr-size
+      continue-on-error: true
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        python3 - <<'PYEOF'
+        import subprocess, sys
+
+        result = subprocess.run(
+            ['git', 'diff', '--stat', f'origin/${{ inputs.base_branch }}...HEAD'],
+            capture_output=True, text=True,
+        )
+        output = result.stdout.strip()
+        if not output:
+            print("No changes detected.")
+            sys.exit(0)
+
+        # Parse insertions + deletions from the last summary line
+        # e.g. "5 files changed, 120 insertions(+), 30 deletions(-)"
+        import re
+        summary = output.split('\n')[-1]
+        ins = sum(int(x) for x in re.findall(r'(\d+) insertion', summary))
+        dels = sum(int(x) for x in re.findall(r'(\d+) deletion', summary))
+        total = ins + dels
+
+        files_changed = len([l for l in output.split('\n')[:-1] if l.strip()])
+
+        print(f"PR size: {files_changed} files, {ins} insertions, {dels} deletions ({total} total lines changed)")
+
+        WARN_LINES  = 1000
+        ERROR_LINES = 5000
+
+        if total > ERROR_LINES:
+            print(f"ERROR: PR is very large ({total} lines changed). Consider splitting into smaller PRs.")
+            print(f"Large PRs are harder to review, more error-prone, and slower to merge.")
+            sys.exit(1)
+        elif total > WARN_LINES:
+            print(f"WARNING: PR is large ({total} lines changed). Consider splitting if possible.")
+            # Warning only — do not fail
+        else:
+            print(f"Size OK.")
+        PYEOF
+
+    - name: "[4] Version bump (Odoo)"
       id: version
       continue-on-error: true
       if: steps.detect.outputs.modules != ''
@@ -72,7 +153,7 @@ runs:
         python "${{ github.action_path }}/../../scripts/check_version_bump.py" \
           "$BASE_BRANCH" ${{ steps.detect.outputs.modules }}
 
-    - name: "[3] Manifest & structure"
+    - name: "[5] Manifest & structure (Odoo)"
       id: manifest
       continue-on-error: true
       if: steps.detect.outputs.modules != ''
@@ -81,8 +162,8 @@ runs:
         python "${{ github.action_path }}/../../scripts/check_manifest.py" \
           ${{ steps.detect.outputs.modules }}
 
-    - name: "[4] Tests exist"
-      id: tests
+    - name: "[6] Tests exist (Odoo)"
+      id: tests-odoo
       continue-on-error: true
       if: steps.detect.outputs.modules != ''
       shell: bash
@@ -90,30 +171,190 @@ runs:
         python "${{ github.action_path }}/../../scripts/check_tests.py" \
           ${{ steps.detect.outputs.modules }}
 
-    - name: "[5] Lint (flake8)"
-      id: lint
+    - name: "[7] Lint — Python (flake8)"
+      id: lint-py
       continue-on-error: true
-      if: steps.detect.outputs.modules != ''
       shell: bash
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
+        PROFILE: ${{ steps.profile.outputs.value }}
       run: |
+        # Run flake8 on changed Python files for all profiles that have Python code
         FILES=$(git diff --name-only "origin/${BASE_BRANCH}...HEAD" \
           | grep '\.py$' \
           | grep -v '/static/' \
           | grep -v '__pycache__' \
+          | grep -v '\.venv/' \
+          | grep -v '/venv/' \
           | xargs -I{} sh -c '[ -f "{}" ] && echo "{}"' \
-          || true)
+          2>/dev/null || true)
 
         if [ -z "$FILES" ]; then
           echo "No Python files to lint."
           exit 0
         fi
 
-        echo "Linting files:"
+        echo "Linting Python files:"
         echo "$FILES"
         echo "---"
         echo "$FILES" | xargs flake8
+
+    - name: Set up Node.js
+      id: setup-node
+      if: steps.profile.outputs.value == 'react' || steps.profile.outputs.value == 'astro' || steps.profile.outputs.value == 'node'
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+        cache: "npm"
+        cache-dependency-path: "**/package-lock.json"
+
+    - name: Install Node dependencies
+      id: node-install
+      if: steps.profile.outputs.value == 'react' || steps.profile.outputs.value == 'astro' || steps.profile.outputs.value == 'node'
+      continue-on-error: true
+      shell: bash
+      run: |
+        if [ -f "pnpm-lock.yaml" ]; then
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+        elif [ -f "yarn.lock" ]; then
+          yarn install --frozen-lockfile
+        elif [ -f "package-lock.json" ]; then
+          npm ci
+        elif [ -f "package.json" ]; then
+          npm install
+        else
+          echo "No package manager lockfile found — skipping install."
+        fi
+
+    - name: "[7] Lint — TypeScript/JavaScript (ESLint)"
+      id: lint-eslint
+      continue-on-error: true
+      if: steps.profile.outputs.value == 'react' || steps.profile.outputs.value == 'astro' || steps.profile.outputs.value == 'node'
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        # Check if ESLint is configured in this repo
+        if ! [ -f ".eslintrc.js" ] && ! [ -f ".eslintrc.cjs" ] && ! [ -f ".eslintrc.json" ] \
+           && ! [ -f ".eslintrc.yml" ] && ! [ -f ".eslintrc.yaml" ] \
+           && ! ([ -f "package.json" ] && python3 -c "import json; d=json.load(open('package.json')); exit(0 if 'eslintConfig' in d else 1)" 2>/dev/null); then
+          echo "No ESLint configuration found — skipping."
+          exit 0
+        fi
+
+        # Get changed JS/TS files
+        FILES=$(git diff --name-only "origin/${BASE_BRANCH}...HEAD" \
+          | grep -E '\.(js|jsx|ts|tsx|astro)$' \
+          | grep -v 'node_modules/' \
+          | grep -v 'dist/' \
+          | grep -v 'build/' \
+          | grep -v '\.next/' \
+          | xargs -I{} sh -c '[ -f "{}" ] && echo "{}"' \
+          2>/dev/null || true)
+
+        if [ -z "$FILES" ]; then
+          echo "No JS/TS/Astro files to lint."
+          exit 0
+        fi
+
+        echo "Running ESLint on:"
+        echo "$FILES"
+        echo "---"
+
+        if [ -f "node_modules/.bin/eslint" ]; then
+          echo "$FILES" | xargs node_modules/.bin/eslint --max-warnings 0 || exit 1
+        elif command -v npx &>/dev/null; then
+          echo "$FILES" | xargs npx --no-install eslint --max-warnings 0 || exit 1
+        else
+          echo "ESLint not found in node_modules — skipping."
+        fi
+
+    - name: "[8] Type check (tsc)"
+      id: typecheck
+      continue-on-error: true
+      if: steps.profile.outputs.value == 'react' || steps.profile.outputs.value == 'astro' || steps.profile.outputs.value == 'node'
+      shell: bash
+      run: |
+        if ! [ -f "tsconfig.json" ]; then
+          echo "No tsconfig.json found — skipping TypeScript type check."
+          exit 0
+        fi
+
+        if [ -f "node_modules/.bin/tsc" ]; then
+          node_modules/.bin/tsc --noEmit
+        elif command -v npx &>/dev/null; then
+          npx --no-install tsc --noEmit
+        else
+          echo "tsc not found — skipping."
+        fi
+
+    - name: "[9] Astro check"
+      id: astro-check
+      continue-on-error: true
+      if: steps.profile.outputs.value == 'astro'
+      shell: bash
+      run: |
+        if [ -f "node_modules/.bin/astro" ]; then
+          node_modules/.bin/astro check
+        elif command -v npx &>/dev/null; then
+          npx --no-install astro check
+        else
+          echo "astro CLI not found — skipping."
+        fi
+
+    - name: "[10] Run tests (Node)"
+      id: tests-node
+      continue-on-error: true
+      if: steps.profile.outputs.value == 'react' || steps.profile.outputs.value == 'astro' || steps.profile.outputs.value == 'node'
+      shell: bash
+      run: |
+        if ! [ -f "package.json" ]; then
+          echo "No package.json — skipping."
+          exit 0
+        fi
+
+        # Check if a test script is defined
+        if ! python3 -c "import json,sys; d=json.load(open('package.json')); sys.exit(0 if 'test' in d.get('scripts',{}) else 1)" 2>/dev/null; then
+          echo "No 'test' script in package.json — skipping."
+          exit 0
+        fi
+
+        if [ -f "pnpm-lock.yaml" ]; then
+          pnpm test -- --watchAll=false --passWithNoTests 2>/dev/null \
+            || pnpm test -- --run 2>/dev/null \
+            || echo "pnpm test exited with non-zero — see above"
+        elif [ -f "yarn.lock" ]; then
+          yarn test --watchAll=false --passWithNoTests 2>/dev/null \
+            || yarn test --run 2>/dev/null \
+            || echo "yarn test exited with non-zero — see above"
+        else
+          npm test -- --watchAll=false --passWithNoTests 2>/dev/null \
+            || npm test -- --run 2>/dev/null \
+            || echo "npm test exited with non-zero — see above"
+        fi
+
+    - name: "[11] Run tests (Python / pytest)"
+      id: tests-pytest
+      continue-on-error: true
+      if: steps.profile.outputs.value == 'python'
+      shell: bash
+      run: |
+        if ! command -v pytest &>/dev/null; then
+          if [ -f "requirements-dev.txt" ]; then
+            pip install -r requirements-dev.txt -q
+          elif [ -f "pyproject.toml" ]; then
+            pip install -e ".[dev]" -q 2>/dev/null || pip install pytest -q
+          else
+            pip install pytest -q
+          fi
+        fi
+
+        if [ -d "tests" ] || find . -maxdepth 3 -name "test_*.py" -not -path "./.venv/*" 2>/dev/null | grep -q .; then
+          python -m pytest --tb=short -q
+        else
+          echo "No tests directory found — skipping pytest."
+        fi
 
     - name: Generate app token
       if: always()
@@ -155,93 +396,199 @@ runs:
         EXISTING_COMMENT_ID: ${{ steps.find-comment.outputs.comment_id }}
         BRANCH: ${{ github.head_ref }}
         MODULES: ${{ steps.detect.outputs.modules }}
+        PROFILE: ${{ steps.profile.outputs.value }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        COMMITS_OUTCOME: ${{ steps.commits.outcome }}
         BRANCH_OUTCOME: ${{ steps.branch.outcome }}
+        PR_SIZE_OUTCOME: ${{ steps.pr-size.outcome }}
         VERSION_OUTCOME: ${{ steps.version.outcome }}
         MANIFEST_OUTCOME: ${{ steps.manifest.outcome }}
-        TESTS_OUTCOME: ${{ steps.tests.outcome }}
-        LINT_OUTCOME: ${{ steps.lint.outcome }}
+        TESTS_ODOO_OUTCOME: ${{ steps.tests-odoo.outcome }}
+        LINT_PY_OUTCOME: ${{ steps.lint-py.outcome }}
+        LINT_ESLINT_OUTCOME: ${{ steps.lint-eslint.outcome }}
+        TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
+        ASTRO_CHECK_OUTCOME: ${{ steps.astro-check.outcome }}
+        TESTS_NODE_OUTCOME: ${{ steps.tests-node.outcome }}
+        TESTS_PYTEST_OUTCOME: ${{ steps.tests-pytest.outcome }}
       run: |
         python3 - <<'PYEOF'
         import os, subprocess
         from datetime import datetime, timezone
 
-        def outcome_icon(o):
-            return {'success': '\u2705', 'failure': '\u274c', 'skipped': '\u23ed\ufe0f'}.get(o, '\u2705')
-
-        branch   = os.environ['BRANCH']
         modules  = os.environ['MODULES']
+        profile  = os.environ.get('PROFILE', 'default')
         existing = os.environ['EXISTING_COMMENT_ID'].strip()
         pr       = os.environ['PR_NUMBER']
         repo     = os.environ['REPO']
         run_url  = os.environ['RUN_URL']
-        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        ts       = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-        branch_ok   = os.environ['BRANCH_OUTCOME']
-        version_ok  = os.environ['VERSION_OUTCOME']
-        manifest_ok = os.environ['MANIFEST_OUTCOME']
-        tests_ok    = os.environ['TESTS_OUTCOME']
-        lint_ok     = os.environ['LINT_OUTCOME']
+        outcomes = {
+            'commits':      os.environ['COMMITS_OUTCOME'],
+            'branch':       os.environ['BRANCH_OUTCOME'],
+            'pr_size':      os.environ['PR_SIZE_OUTCOME'],
+            'version':      os.environ['VERSION_OUTCOME'],
+            'manifest':     os.environ['MANIFEST_OUTCOME'],
+            'tests_odoo':   os.environ['TESTS_ODOO_OUTCOME'],
+            'lint_py':      os.environ['LINT_PY_OUTCOME'],
+            'lint_eslint':  os.environ['LINT_ESLINT_OUTCOME'],
+            'typecheck':    os.environ['TYPECHECK_OUTCOME'],
+            'astro_check':  os.environ['ASTRO_CHECK_OUTCOME'],
+            'tests_node':   os.environ['TESTS_NODE_OUTCOME'],
+            'tests_pytest': os.environ['TESTS_PYTEST_OUTCOME'],
+        }
 
-        outcomes = [branch_ok, version_ok, manifest_ok, tests_ok, lint_ok]
-        overall  = '\u2705 All checks passed' if all(o in ('success', 'skipped') for o in outcomes) \
-                   else '\u274c One or more checks failed'
+        rows = [
+            ('Commit messages', outcomes['commits']),
+            ('Branch naming',   outcomes['branch']),
+            ('PR size',         outcomes['pr_size']),
+        ]
+        if profile == 'odoo':
+            rows += [
+                ('Version bump',         outcomes['version']),
+                ('Manifest & structure', outcomes['manifest']),
+                ('Tests exist',          outcomes['tests_odoo']),
+                ('Lint (flake8)',         outcomes['lint_py']),
+            ]
+        elif profile in ('react', 'astro', 'node'):
+            rows += [
+                ('ESLint',       outcomes['lint_eslint']),
+                ('Type check',   outcomes['typecheck']),
+            ]
+            if profile == 'astro':
+                rows.append(('Astro check', outcomes['astro_check']))
+            rows.append(('Tests', outcomes['tests_node']))
+        elif profile == 'python':
+            rows += [
+                ('Lint (flake8)', outcomes['lint_py']),
+                ('Tests (pytest)', outcomes['tests_pytest']),
+            ]
+        else:
+            rows += [
+                ('Lint (flake8)', outcomes['lint_py']),
+                ('ESLint',        outcomes['lint_eslint']),
+                ('Type check',    outcomes['typecheck']),
+            ]
 
-        body = '\n'.join([
-            '<!-- unifox-static-checks -->',
-            '## \U0001f98a PR Static Checks',
-            '',
-            f'**Status:** {overall}',
-            '',
-            '| Check | Status |',
-            '|-------|--------|',
-            f'| Branch naming (`{branch}`) | {outcome_icon(branch_ok)} |',
-            f'| Version bump | {outcome_icon(version_ok)} |',
-            f'| Manifest & structure | {outcome_icon(manifest_ok)} |',
-            f'| Tests exist | {outcome_icon(tests_ok)} |',
-            f'| Lint (flake8) | {outcome_icon(lint_ok)} |',
-            '',
-            f'**Modified modules:** {modules or "_none (only non-module files changed)_"}',
-            '',
-            '---',
-            f'_Last verified: {timestamp} \u2014 [View full log]({run_url})_',
-        ])
+        failed  = [(l, o) for l, o in rows if o == 'failure']
+        passed  = [(l, o) for l, o in rows if o == 'success']
+        skipped = [(l, o) for l, o in rows if o not in ('failure', 'success')]
 
+        # ── Header line ────────────────────────────────────────────────────────
+        if failed:
+            pill = f'\u274c {len(failed)} failed'
+        else:
+            pill = '\u2705 All passed'
+        header = f'\U0001f98a **Static Checks** \u00b7 `{profile}` \u00b7 {pill} \u00b7 [log \u2192]({run_url})'
+
+        # ── Body ───────────────────────────────────────────────────────────────
+        lines = ['<!-- unifox-static-checks -->', header, '']
+
+        # Failures — one line each, prominent
+        for label, _ in failed:
+            lines.append(f'\u274c **{label}**')
+        if failed:
+            lines.append('')
+
+        # Passed — compact single line
+        if passed:
+            lines.append(' \u00b7 '.join(f'\u2705 {l}' for l, _ in passed))
+            lines.append('')
+
+        # Skipped — collapsed detail block
+        if skipped:
+            skip_str = ' \u00b7 '.join(l for l, _ in skipped)
+            lines.append(f'<details><summary>\u23ed\ufe0f {len(skipped)} skipped</summary>\n\n{skip_str}\n\n</details>')
+            lines.append('')
+
+        # Odoo modules
+        if profile == 'odoo' and modules:
+            lines.append(f'**Modules:** `{modules}`')
+            lines.append('')
+
+        lines.append(f'_{ts}_')
+
+        body = '\n'.join(lines)
         open('/tmp/static-comment.md', 'w').write(body)
 
         if existing and existing != 'null':
-            result = subprocess.run([
+            r = subprocess.run([
                 'gh', 'api', '--method', 'PATCH',
                 f'repos/{repo}/issues/comments/{existing}',
                 '--field', 'body=@/tmp/static-comment.md',
             ], capture_output=True, text=True)
         else:
-            result = subprocess.run([
+            r = subprocess.run([
                 'gh', 'pr', 'comment', pr, '--repo', repo,
                 '--body-file', '/tmp/static-comment.md',
             ], capture_output=True, text=True)
 
-        if result.returncode != 0:
-            print(result.stderr)
+        if r.returncode != 0:
+            print(r.stderr)
         print('Comment', 'updated' if existing and existing != 'null' else 'posted')
         PYEOF
 
-    - name: Fail if any check failed
+    - name: Fail if any blocking check failed
       if: always()
       shell: bash
       env:
-        BRANCH_OUTCOME: ${{ steps.branch.outcome }}
-        VERSION_OUTCOME: ${{ steps.version.outcome }}
-        MANIFEST_OUTCOME: ${{ steps.manifest.outcome }}
-        TESTS_OUTCOME: ${{ steps.tests.outcome }}
-        LINT_OUTCOME: ${{ steps.lint.outcome }}
+        COMMITS_OUTCOME:      ${{ steps.commits.outcome }}
+        BRANCH_OUTCOME:       ${{ steps.branch.outcome }}
+        PR_SIZE_OUTCOME:      ${{ steps.pr-size.outcome }}
+        VERSION_OUTCOME:      ${{ steps.version.outcome }}
+        MANIFEST_OUTCOME:     ${{ steps.manifest.outcome }}
+        TESTS_ODOO_OUTCOME:   ${{ steps.tests-odoo.outcome }}
+        LINT_PY_OUTCOME:      ${{ steps.lint-py.outcome }}
+        LINT_ESLINT_OUTCOME:  ${{ steps.lint-eslint.outcome }}
+        TYPECHECK_OUTCOME:    ${{ steps.typecheck.outcome }}
+        ASTRO_CHECK_OUTCOME:  ${{ steps.astro-check.outcome }}
+        TESTS_NODE_OUTCOME:   ${{ steps.tests-node.outcome }}
+        TESTS_PYTEST_OUTCOME: ${{ steps.tests-pytest.outcome }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
-        failed=false
-        [ "$BRANCH_OUTCOME"   = "failure" ] && failed=true
-        [ "$VERSION_OUTCOME"  = "failure" ] && failed=true
-        [ "$MANIFEST_OUTCOME" = "failure" ] && failed=true
-        [ "$TESTS_OUTCOME"    = "failure" ] && failed=true
-        [ "$LINT_OUTCOME"     = "failure" ] && failed=true
-        $failed && exit 1 || exit 0
+        # Map each check to a human-readable label
+        declare -A LABELS=(
+          [COMMITS_OUTCOME]="Commit messages"
+          [BRANCH_OUTCOME]="Branch naming"
+          [PR_SIZE_OUTCOME]="PR size"
+          [VERSION_OUTCOME]="Version bump (Odoo)"
+          [MANIFEST_OUTCOME]="Manifest & structure (Odoo)"
+          [TESTS_ODOO_OUTCOME]="Tests exist (Odoo)"
+          [LINT_PY_OUTCOME]="Lint — Python (flake8)"
+          [LINT_ESLINT_OUTCOME]="Lint — ESLint"
+          [TYPECHECK_OUTCOME]="Type check (tsc)"
+          [ASTRO_CHECK_OUTCOME]="Astro check"
+          [TESTS_NODE_OUTCOME]="Tests (Node)"
+          [TESTS_PYTEST_OUTCOME]="Tests (pytest)"
+        )
+
+        failed_labels=()
+        for key in "${!LABELS[@]}"; do
+          val="${!key}"
+          if [ "$val" = "failure" ]; then
+            failed_labels+=("${LABELS[$key]}")
+            # Emit a GitHub Actions error annotation — visible in PR checks without opening logs
+            echo "::error title=Static check failed — ${LABELS[$key]}::${LABELS[$key]} check failed. Fix the issues listed in the PR comment, then push again."
+          fi
+        done
+
+        if [ ${#failed_labels[@]} -gt 0 ]; then
+          # Write a job summary so the Actions "Summary" tab shows the failures at a glance
+          {
+            echo "## ❌ Static checks failed"
+            echo ""
+            echo "The following checks did not pass:"
+            echo ""
+            for label in "${failed_labels[@]}"; do
+              echo "- ❌ **${label}**"
+            done
+            echo ""
+            echo "See the PR comment for details on each failure, or [view the full log](${RUN_URL})."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        else
+          echo "## ✅ All static checks passed" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi

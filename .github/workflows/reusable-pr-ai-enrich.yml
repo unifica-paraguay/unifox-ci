@@ -7,32 +7,58 @@ name: "[Reusable] PR AI Enrichment"
 #     ai-enrich:
 #       uses: unifica-paraguay/unifox-ci/.github/workflows/reusable-pr-ai-enrich.yml@v1
 #       with:
-#         profile: odoo   # or 'default'
+#         profile: auto   # auto-detects: odoo | react | astro | python | node | default
 #       secrets: inherit
+#
+# Profiles: odoo | react | astro | python | node | default | auto (default)
+# 'auto' detects the framework from repository contents automatically.
 
 on:
   workflow_call:
     inputs:
       profile:
-        description: "unifox-ci review profile (e.g. 'odoo', 'default')"
+        description: "unifox-ci review profile (odoo/react/astro/python/node/default/auto)"
         type: string
-        default: "default"
+        default: "auto"
+      enable_security_scan:
+        description: "Run the security scan job"
+        type: boolean
+        default: true
+      enable_labels:
+        description: "Auto-assign PR labels"
+        type: boolean
+        default: true
+      enable_static_checks:
+        description: "Run static checks (commit messages, branch naming, lint, tests)"
+        type: boolean
+        default: true
+      fail_on_security_critical:
+        description: "Block merge on critical security findings"
+        type: boolean
+        default: true
+      enable_version_bump:
+        description: "AI-driven Odoo module version bumping (Odoo profile only)"
+        type: boolean
+        default: false
+      enable_odoo_tests:
+        description: "Run Odoo tests: Layer 1 (modified modules) + Layer 2 (native deps)"
+        type: boolean
+        default: false
 
 jobs:
-  # Verify the unifox-ci App token exactly once before running the parallel jobs.
-  # This prevents both enrich-metadata and ai-code-review from each posting the
-  # same "not installed" comment when the App is absent.
+  # -------------------------------------------------------------------------
+  # Verify the unifox-ci App token exactly once before running parallel jobs.
+  # Prevents all jobs from posting the same "not installed" comment.
+  # -------------------------------------------------------------------------
   pre-flight:
     name: Verify App token
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write  # needed to post the "not installed" comment
+      pull-requests: write
     steps:
       - name: Generate app token
         id: gen-token
-        # continue-on-error is intentional: the following step needs to run when
-        # token generation fails so it can post the install instructions and exit 1.
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
@@ -58,28 +84,28 @@ jobs:
             '## ⚠️ unifox-ci not installed' \
             'This workflow requires the **unifox-ci** GitHub App. Without it, CI cannot post review comments or enrichments on this repository.' \
             "$INSTALL_URL" "$SETTINGS_URL")
-          # || true is intentional: a failure to post the helpful comment must not
-          # mask the real error. The exit 1 below is what actually fails the job.
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$MSG" || true
           echo "ERROR: unifox-ci GitHub App is not installed — install it to unblock CI."
           exit 1
 
-  # NOTE: composite actions below are always fetched at @v1 from the unifox-ci repo.
-  # GitHub Actions does not support expressions in `uses:`, so there is no way to
-  # pass a dynamic ref. Consequence: changes to actions/pr-enrich or actions/pr-review
-  # on a feature branch are NOT exercised by the local pipeline until the v1 tag is
-  # advanced to that commit. Advance v1 after every push to keep the tag in sync.
+  # -------------------------------------------------------------------------
+  # NOTE: composite actions below are fetched at @claude/improve-bot-testing-q5hXf
+  # so this feature branch tests its own code.
+  # When merging to main: revert all @claude/... refs back to @v1 and advance
+  # the v1 tag to the new main HEAD (git tag -f v1 HEAD && git push --force-tags).
+  # -------------------------------------------------------------------------
+
   enrich-metadata:
     name: Update title & description
     needs: pre-flight
     runs-on: ubuntu-latest
     permissions:
-      contents: read  # for checkout; all PR writes use the App token
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@v1
+      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@claude/improve-bot-testing-q5hXf
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
@@ -88,20 +114,141 @@ jobs:
           event_action: ${{ github.event.action }}
           profile: ${{ inputs.profile }}
 
-  ai-code-review:
-    name: AI code review
-    needs: [pre-flight, enrich-metadata]  # serialised to avoid Anthropic rate-limit collision
+  version-bump:
+    name: Version bump (Odoo)
+    needs: pre-flight
+    if: ${{ inputs.enable_version_bump }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read  # for checkout; all PR writes use the App token
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-review@v1
+      - uses: unifica-paraguay/unifox-ci/actions/pr-version-bump@claude/improve-bot-testing-q5hXf
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           base_branch: ${{ github.base_ref }}
           profile: ${{ inputs.profile }}
+
+  odoo-tests-layer1:
+    name: Tests — Layer 1 (modified modules)
+    needs: pre-flight
+    if: ${{ inputs.enable_odoo_tests }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer1@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+
+  odoo-tests-layer2:
+    name: Tests — Layer 2 (native dependencies)
+    needs: [pre-flight, odoo-tests-layer1]
+    if: always() && inputs.enable_odoo_tests && needs.odoo-tests-layer1.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer2@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+
+  ai-code-review:
+    name: AI code review
+    # Waits for static-checks so the review verdict reflects pipeline health.
+    # Odoo test jobs are not in needs (they're conditional) — their result
+    # is passed via static_checks_failed input using needs context expressions.
+    needs: [pre-flight, enrich-metadata, static-checks]
+    if: always() && needs.pre-flight.result == 'success' && needs.enrich-metadata.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-review@claude/improve-bot-testing-q5hXf
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+          static_checks_failed: ${{ needs.static-checks.result == 'failure' }}
+
+  security-scan:
+    name: Security scan
+    needs: pre-flight
+    if: ${{ inputs.enable_security_scan }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-security-scan@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          fail_on_critical: ${{ inputs.fail_on_security_critical }}
+
+  static-checks:
+    name: Static checks
+    needs: pre-flight
+    if: ${{ inputs.enable_static_checks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-static-checks@claude/improve-bot-testing-q5hXf
+        with:
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}
+
+  auto-labels:
+    name: Auto-assign labels
+    needs: pre-flight
+    if: ${{ inputs.enable_labels }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-labels@claude/improve-bot-testing-q5hXf
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
