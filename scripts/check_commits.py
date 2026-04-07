@@ -79,6 +79,9 @@ EXEMPT_PREFIXES = (
     "Initial commit",
 )
 
+# GitHub auto-generates "Merge <sha> into <sha>" when syncing a branch via the UI.
+_MERGE_SHA_RE = re.compile(r"^Merge [0-9a-f]{40} into [0-9a-f]{40}$")
+
 # First words that suggest non-imperative mood (soft warnings only).
 # Past tense: "added", "fixed", "updated", "removed" …
 # Gerund:     "adding", "fixing", "updating" …
@@ -125,6 +128,9 @@ def validate_subject(subject: str) -> tuple[list[str], list[str]]:
     for prefix in EXEMPT_PREFIXES:
         if subject.startswith(prefix):
             return [], []
+
+    if _MERGE_SHA_RE.match(subject):
+        return [], []
 
     m = SUBJECT_RE.match(subject)
     if not m:
