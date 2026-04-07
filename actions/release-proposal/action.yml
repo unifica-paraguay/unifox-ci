@@ -263,7 +263,11 @@ runs:
              '--header', 'Accept: application/vnd.github.v3+json'],
             capture_output=True, text=True, env=env,
         )
-        prs = json.loads(pr_r.stdout or '[]')
+        if pr_r.returncode != 0:
+            print(f"Warning: could not fetch associated PRs: {pr_r.stderr.strip()}")
+            prs = []
+        else:
+            prs = json.loads(pr_r.stdout or '[]')
         pr_number = str(prs[0]['number']) if prs else ''
         print(f'Associated PR: #{pr_number}' if pr_number else 'No associated PR found')
 
@@ -323,10 +327,15 @@ runs:
 
         # Post comment on PR if one was found
         if pr_number:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                import json as _json
+                _json.dump({'body': body}, tmp)
+                tmp_path = tmp.name
             subprocess.run([
                 'gh', 'api', '--method', 'POST',
                 f'repos/{repo}/issues/{pr_number}/comments',
-                '-f', f'body={body}',
+                '--input', tmp_path,
             ], env=env, check=True)
             print(f'Posted proposal comment on PR #{pr_number}')
         else:

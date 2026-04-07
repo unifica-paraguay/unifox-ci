@@ -18,6 +18,10 @@ on:
         type: string
         default: "default"
 
+concurrency:
+  group: pr-ai-enrich-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write

@@ -31,7 +31,7 @@ jobs:
   release:
     name: Create release ${{ needs.propose.outputs.proposed_tag }}
     needs: propose
-    if: needs.propose.outputs.proposed_tag != ''
+    if: needs.propose.result == 'success' && needs.propose.outputs.proposed_tag != ''
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -47,6 +47,18 @@ jobs:
         with:
           app-id: ${{ secrets.UNIFOX_CI_APP_ID }}
           private-key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+
+      - name: Warn if bot token unavailable
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ steps.bot-token.outputs.token }}
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "WARNING: GitHub App token unavailable — release will be created as github-actions[bot]"
+            echo "Fix: install the unifox-ci GitHub App on this repository (GitHub Settings → Apps)."
+          else
+            echo "Token: using GitHub App (unifox-ci[bot])"
+          fi
 
       - uses: actions/checkout@v4
         with:
@@ -85,7 +97,7 @@ jobs:
           # Read the actual tag created (may differ from proposed if Claude re-analyzed)
           try:
               tag = json.load(open('/tmp/release_parsed.json'))['new_tag']
-          except Exception:
+          except FileNotFoundError:
               tag = os.environ['PROPOSED_TAG']
 
           release_url = f'https://github.com/{repo}/releases/tag/{tag}'
@@ -95,6 +107,9 @@ jobs:
               ['gh', 'api', f'repos/{repo}/issues/{pr_number}/comments', '--paginate'],
               capture_output=True, text=True, env=env,
           )
+          if comments_r.returncode != 0:
+              print(f"Failed to fetch comments: {comments_r.stderr.strip()}")
+              sys.exit(1)
           comments = json.loads(comments_r.stdout or '[]')
           proposal = next(
               (c for c in comments if '<!-- unifox-release-proposal -->' in c.get('body', '')),
