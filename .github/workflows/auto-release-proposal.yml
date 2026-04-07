@@ -42,9 +42,9 @@ jobs:
     steps:
       - name: Generate bot token
         id: bot-token
-        # continue-on-error is intentional: repos without the App installed
-        # fall back to github.token (github-actions[bot]). The next step
-        # logs a visible warning so operators are aware of the fallback.
+        # continue-on-error is intentional: the following "Require app token" step
+        # needs to run even when token generation fails (App not installed / wrong credentials)
+        # so it can log actionable install instructions and fail with a clear message.
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
@@ -82,7 +82,7 @@ jobs:
 
       - name: Update PR comment
         env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_NUMBER: ${{ needs.propose.outputs.pr_number }}
           PROPOSED_TAG: ${{ needs.propose.outputs.proposed_tag }}
           REPO: ${{ github.repository }}

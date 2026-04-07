@@ -242,6 +242,7 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         TAG_PREFIX: ${{ inputs.tag_prefix }}
         LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
         python3 - <<'PYEOF'
         import json, os, subprocess, sys
@@ -252,13 +253,14 @@ runs:
             print("ERROR: /tmp/release_parsed.json not found — 'Ask Claude for version bump' step likely failed.")
             sys.exit(1)
 
-        repo      = os.environ['REPO']
-        sha       = os.environ['SHA']
-        run_url   = os.environ['RUN_URL']
-        tag_prefix = os.environ['TAG_PREFIX']
-        last_tag  = os.environ.get('LAST_TAG') or '(none — first release)'
-        gh_token  = os.environ['GH_TOKEN']
-        env       = {**os.environ, 'GH_TOKEN': gh_token}
+        repo        = os.environ['REPO']
+        sha         = os.environ['SHA']
+        run_url     = os.environ['RUN_URL']
+        tag_prefix  = os.environ['TAG_PREFIX']
+        last_tag    = os.environ.get('LAST_TAG') or '(none — first release)'
+        base_branch = os.environ.get('BASE_BRANCH', 'main')
+        gh_token    = os.environ['GH_TOKEN']
+        env         = {**os.environ, 'GH_TOKEN': gh_token}
 
         new_tag   = data['new_tag']
         bump_type = data['bump_type']
@@ -279,7 +281,14 @@ runs:
             except json.JSONDecodeError as e:
                 print(f"Warning: could not parse PR list response: {e}")
                 prs = []
-        pr_number = str(prs[0]['number']) if prs else ''
+        # Filter to PRs targeting the release branch to avoid picking the wrong PR
+        # when a commit has been cherry-picked or backported to multiple PRs.
+        matching = [p for p in prs if p.get('base', {}).get('ref') == base_branch]
+        if not matching and prs:
+            print(f"Warning: none of the {len(prs)} associated PR(s) targets '{base_branch}' — "
+                  f"using first PR as fallback. PRs found: {[p['number'] for p in prs]}")
+            matching = prs[:1]
+        pr_number = str(matching[0]['number']) if matching else ''
         print(f'Associated PR: #{pr_number}' if pr_number else 'No associated PR found')
 
         # Build changelog markdown
@@ -344,15 +353,19 @@ runs:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
                     json.dump({'body': body}, tmp)
                     tmp_path = tmp.name
-                subprocess.run([
+                r_comment = subprocess.run([
                     'gh', 'api', '--method', 'POST',
                     f'repos/{repo}/issues/{pr_number}/comments',
                     '--input', tmp_path,
-                ], env=env, check=True)
+                ], env=env, capture_output=True, text=True)
+                if r_comment.returncode != 0:
+                    print(f'Warning: could not post proposal comment on PR #{pr_number}: '
+                          f'{r_comment.stderr.strip()}')
+                else:
+                    print(f'Posted proposal comment on PR #{pr_number}')
             finally:
                 if tmp_path:
                     os.unlink(tmp_path)
-            print(f'Posted proposal comment on PR #{pr_number}')
         else:
             print('Skipping PR comment — no associated PR for this push')
 

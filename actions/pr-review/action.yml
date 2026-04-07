@@ -52,8 +52,8 @@ runs:
         ORG="${REPO%%/*}"
         INSTALL_URL="https://github.com/apps/unifox-ci"
         SETTINGS_URL="https://github.com/organizations/${ORG}/settings/installations"
-        MSG="## ⚠️ unifox-ci not installed\n\nThis workflow requires the **unifox-ci** GitHub App. Without it, CI cannot post review comments or enrichments on this repository.\n\n**To fix:** [Install unifox-ci →](${INSTALL_URL})\nOr enable it for this repo in your [organization app settings](${SETTINGS_URL}).\n\nOnce installed, re-run this workflow."
-        gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(echo -e "$MSG")" || true
+        MSG=$(printf '## ⚠️ unifox-ci not installed\n\nThis workflow requires the **unifox-ci** GitHub App. Without it, CI cannot post review comments or enrichments on this repository.\n\n**To fix:** [Install unifox-ci →](%s)\nOr enable it for this repo in your [organization app settings](%s).\n\nOnce installed, re-run this workflow.' "$INSTALL_URL" "$SETTINGS_URL")
+        gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$MSG" || true
         echo "ERROR: unifox-ci GitHub App is not installed — install it to unblock CI."
         exit 1
 
@@ -523,23 +523,24 @@ runs:
             if not tid:
                 print(f'Warning: no thread_id mapping for comment {cid} — cannot auto-resolve')
                 continue
-            r_reply = gh(
-                f'repos/{repo}/pulls/comments/{cid}/replies',
-                body={'body': '\u2705 Resolved \u2014 not present in the latest diff.'},
-                method='POST',
+            # Resolve the thread first; only post the reply if resolution succeeds.
+            # This avoids a dangling reply comment when the GraphQL call fails.
+            gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
+                   '{thread{id isResolved}}}')
+            gql_r = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
+                capture_output=True, text=True,
             )
-            if r_reply.returncode == 0:
-                gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
-                       '{thread{id isResolved}}}')
-                gql_r = subprocess.run(
-                    ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
-                    capture_output=True, text=True,
+            if gql_r.returncode == 0:
+                auto_resolved += 1
+                print(f'Auto-resolved thread for comment {cid}')
+                gh(
+                    f'repos/{repo}/pulls/comments/{cid}/replies',
+                    body={'body': '\u2705 Resolved \u2014 not present in the latest diff.'},
+                    method='POST',
                 )
-                if gql_r.returncode == 0:
-                    auto_resolved += 1
-                    print(f'Auto-resolved thread for comment {cid}')
-                else:
-                    print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
+            else:
+                print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
         if auto_resolved:
             print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
 

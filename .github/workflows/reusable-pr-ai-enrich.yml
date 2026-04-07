@@ -19,7 +19,7 @@ on:
         default: "default"
 
 concurrency:
-  group: pr-ai-enrich-${{ github.event.pull_request.number }}
+  group: pr-ai-enrich-${{ github.repository }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
