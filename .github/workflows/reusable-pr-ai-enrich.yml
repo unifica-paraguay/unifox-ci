@@ -87,7 +87,7 @@ jobs:
 
   ai-code-review:
     name: AI code review
-    needs: pre-flight
+    needs: [pre-flight, enrich-metadata]  # serialised to avoid Anthropic rate-limit collision
     runs-on: ubuntu-latest
     permissions:
       contents: read  # for checkout; all PR writes use the App token

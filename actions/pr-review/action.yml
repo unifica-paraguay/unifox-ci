@@ -177,9 +177,11 @@ runs:
         from pathlib import Path
 
         base    = os.environ.get('BASE_BRANCH', 'main')
-        BUDGET  = 20000          # 20 KB total for full file contents
-        PY_MAX  = 4000           # include Python/XML/other only if file is this small
-        ALWAYS  = {'.yml', '.yaml', '.sh', '.bash'}  # always include regardless of size
+        BUDGET    = 20000        # 20 KB total for full file contents
+        PY_MAX    = 4000         # include Python/XML/other only if file is this small
+        ALWAYS    = {'.yml', '.yaml', '.sh', '.bash'}  # always include, but still capped
+        YAML_MAX  = 8000         # per-file cap for YAML/shell to prevent one large action
+                                 # file from consuming the entire budget
 
         result = subprocess.run(
             ['git', 'diff', '--diff-filter=AM', '--name-only', f'origin/{base}...HEAD'],
@@ -198,9 +200,12 @@ runs:
             except Exception:
                 continue
 
-            # Skip large non-YAML files; they are covered by the diff
+            # Skip large non-YAML/shell files; they are covered by the diff
             if ext not in ALWAYS and len(content) > PY_MAX:
                 continue
+            # Cap YAML/shell per-file so one large action file can't exhaust the budget
+            if ext in ALWAYS and len(content) > YAML_MAX:
+                content = content[:YAML_MAX] + '\n... (truncated — file exceeds per-file cap)\n'
 
             remaining = BUDGET - used
             if remaining <= 50:
@@ -581,7 +586,8 @@ runs:
             if not r.get('resolved', True)
         }
         already_replied_resolved = {
-            r.get('comment_id') for r in data.get('reply_to', []) if r.get('resolved')
+            r['comment_id'] for r in data.get('reply_to', [])
+            if r.get('resolved') and 'comment_id' in r
         }
         auto_resolved = 0
         for comment in prev:
