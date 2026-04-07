@@ -144,34 +144,36 @@ runs:
         modules_list = '\n'.join(f'- {m}' for m in failed_modules.splitlines() if m) \
             or '- (could not determine)'
 
-        body = f"""## Nightly test suite failure — {date}
-
-The scheduled full test run on branch `19.0` failed.
-
-**Run:** {run_url}
-**Date:** {date} (Paraguay time)
-
-### Failed modules
-
-{modules_list}
-
-### Failure lines
-
-```
-{failure_lines[:3000]}
-```
-
-<details>
-<summary>Last 100 lines of test output</summary>
-
-```
-{output_tail}
-```
-</details>
-
----
-*Opened automatically by unifox-ci. Close this issue once the failures are resolved.*
-"""
+        body_parts = [
+            f'## Nightly test suite failure \u2014 {date}',
+            '',
+            'The scheduled full test run on branch `19.0` failed.',
+            '',
+            f'**Run:** {run_url}',
+            f'**Date:** {date} (Paraguay time)',
+            '',
+            '### Failed modules',
+            '',
+            modules_list,
+            '',
+            '### Failure lines',
+            '',
+            '```',
+            failure_lines[:3000],
+            '```',
+            '',
+            '<details>',
+            '<summary>Last 100 lines of test output</summary>',
+            '',
+            '```',
+            output_tail,
+            '```',
+            '</details>',
+            '',
+            '---',
+            '*Opened automatically by unifox-ci. Close this issue once the failures are resolved.*',
+        ]
+        body = '\n'.join(body_parts)
 
         with open('/tmp/issue_body.md', 'w') as f:
             f.write(body)
