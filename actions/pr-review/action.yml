@@ -222,9 +222,16 @@ runs:
             'is_resolved': c2t.get(c['id'], {}).get('is_resolved', False),
         } for c in bot_comments]
 
+        # Only APPROVED/CHANGES_REQUESTED reviews can be dismissed via the API.
+        # COMMENTED reviews silently fail the dismiss call — filter them out.
+        dismissable_ids = [
+            r['id'] for r in bot_reviews
+            if r.get('state') in ('APPROVED', 'CHANGES_REQUESTED')
+        ]
+
         json.dump({
             'prev_comments':     prev_comments,
-            'bot_review_ids':    [r['id'] for r in bot_reviews],
+            'bot_review_ids':    dismissable_ids,
             'comment_to_thread': {str(k): v for k, v in c2t.items()},
         }, open('/tmp/review_context.json', 'w'), indent=2)
 
