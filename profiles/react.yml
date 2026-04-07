@@ -1,0 +1,63 @@
+# unifox-ci profile: react
+# Rules for React / Next.js repositories.
+
+name: react
+description: "Profile for React and Next.js repositories"
+
+guidelines:
+  - git_guidelines.rst        # Commit format [TAG] scope: description
+  - js_guidelines.md          # JavaScript / TypeScript / React best practices
+
+branch_pattern: ".*"
+branch_hint: "No specific branch naming convention enforced"
+
+module_manifest: null
+module_prefix: null
+
+version_format: "semver"  # X.Y.Z managed via package.json
+
+# Lint & type-check
+linters:
+  - eslint
+  - tsc
+
+# Test runner
+test_runner: node
+test_command: "npm test -- --watchAll=false --passWithNoTests"
+test_command_pnpm: "pnpm test -- --watchAll=false --passWithNoTests"
+test_command_yarn: "yarn test --watchAll=false --passWithNoTests"
+
+# Files to include in AI diff review (on top of base)
+diff_patterns:
+  - "*.ts"
+  - "*.tsx"
+  - "*.js"
+  - "*.jsx"
+  - "*.css"
+  - "*.scss"
+  - "*.json"
+
+# Paths to exclude from diff (never useful in review)
+diff_exclude:
+  - "node_modules/*"
+  - "dist/*"
+  - "build/*"
+  - ".next/*"
+  - "*.min.js"
+  - "*.lock"
+  - "package-lock.json"
+  - "pnpm-lock.yaml"
+
+# Review focus areas (injected into Claude checklist)
+review_focus:
+  - "React hooks rules (no hooks in loops, conditions, or nested functions)"
+  - "Missing dependency arrays in useEffect / useCallback / useMemo"
+  - "Prop types or TypeScript interface definitions for all component props"
+  - "Key prop on list items — must be stable, unique, and not array index when list is reordered"
+  - "Async effects: use cleanup functions or AbortController to prevent state updates on unmounted components"
+  - "No direct DOM manipulation (use refs and React patterns)"
+  - "No console.log / debugger left in production code"
+  - "Accessibility: interactive elements must have ARIA labels or visible text"
+  - "Performance: avoid creating new objects/arrays/functions inline in JSX that break memoization"
+  - "Security: no dangerouslySetInnerHTML with unsanitized user input"
+  - "Next.js: use next/image for images, next/link for navigation"

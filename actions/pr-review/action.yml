@@ -3,7 +3,10 @@ description: >
   Stateful AI code review using Claude. Reads previous bot review threads
   (including resolution status) before calling Claude so it replies to
   existing threads instead of duplicating, and stays consistent across pushes.
-  Enforces Odoo coding guidelines and git guidelines.
+  Supports all org profiles: odoo, react, astro, python, node, default.
+  Uses severity levels (critical/warning/suggestion) so only real blockers
+  trigger CHANGES_REQUESTED; suggestions are grouped in the summary comment
+  and never generate inline noise.
 
 inputs:
   anthropic_api_key:
@@ -20,9 +23,9 @@ inputs:
     required: false
     default: "main"
   profile:
-    description: "Repository profile (odoo, default)"
+    description: "Repository profile (odoo, react, astro, python, node, default, auto)"
     required: false
-    default: "default"
+    default: "auto"
 
 runs:
   using: "composite"
@@ -58,39 +61,105 @@ runs:
       shell: bash
       run: pip install requests
 
+    - name: Detect profile
+      id: profile
+      shell: bash
+      env:
+        PROFILE_INPUT: ${{ inputs.profile }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_framework.sh"
+        if [ "$PROFILE_INPUT" = "auto" ] || [ -z "$PROFILE_INPUT" ]; then
+          PROFILE=$("${{ github.action_path }}/../../scripts/detect_framework.sh" .)
+          echo "Auto-detected profile: $PROFILE"
+        else
+          PROFILE="$PROFILE_INPUT"
+          echo "Using explicit profile: $PROFILE"
+        fi
+        echo "value=${PROFILE}" >> "$GITHUB_OUTPUT"
+
     - name: Collect diff
       shell: bash
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
+        PROFILE: ${{ steps.profile.outputs.value }}
       run: |
         git fetch origin "$BASE_BRANCH"
 
         # Collect diffs in priority order, truncating to 48 KB total.
-        # Priority: .py > __manifest__.py > .xml > .yml/.yaml > .sh > rest
+        # Sections are ordered by review priority; the budget ensures the most
+        # important code is always included even for large PRs.
+        # --diff-filter=AM: only Added/Modified files (no pure Deletions).
         python3 - <<'DIFFEOF'
         import os, subprocess
         from pathlib import Path
 
-        base = os.environ['BASE_BRANCH']
+        base    = os.environ['BASE_BRANCH']
+        profile = os.environ.get('PROFILE', 'default')
 
         def diff(patterns):
-            # --diff-filter=AM: only Added/Modified files — excludes pure Deletions.
-            # This prevents large "extract to separate repo" PRs from consuming the
-            # entire budget with removed lines that carry no reviewable new content.
             args = ['git', 'diff', '--diff-filter=AM', f'origin/{base}...HEAD', '--'] + list(patterns)
             r = subprocess.run(args, capture_output=True, text=True)
             return r.stdout
 
-        sections = [
-            ('Python files',        diff(['*.py', ':!*/static/*', ':!*/__pycache__/*'])),
-            ('Manifest files',      diff(['*/__manifest__.py'])),
-            ('XML files',           diff(['*.xml'])),
-            ('YAML/config files',   diff(['*.yml', '*.yaml', '.flake8', '.unifox.yml',
-                                          '*.cfg', '*.conf', '*.ini'])),
-            ('Shell scripts',       diff(['*.sh'])),
-            ('Docker files',        diff(['docker-compose*', 'Dockerfile*'])),
-            ('Markdown files',      diff(['*.md'])),
-        ]
+        # Base sections present for every profile
+        sections = []
+
+        if profile == 'odoo':
+            sections = [
+                ('Python files',      diff(['*.py', ':!*/static/*', ':!*/__pycache__/*'])),
+                ('Manifest files',    diff(['*/__manifest__.py'])),
+                ('XML files',         diff(['*.xml'])),
+                ('YAML/config files', diff(['*.yml', '*.yaml', '.flake8', '.unifox.yml',
+                                            '*.cfg', '*.conf', '*.ini'])),
+                ('Shell scripts',     diff(['*.sh'])),
+                ('Docker files',      diff(['docker-compose*', 'Dockerfile*'])),
+                ('Markdown files',    diff(['*.md'])),
+            ]
+        elif profile in ('react', 'astro', 'node'):
+            sections = [
+                ('TypeScript files',  diff(['*.ts', '*.tsx',
+                                            ':!node_modules/*', ':!dist/*',
+                                            ':!build/*', ':!.next/*'])),
+                ('JavaScript files',  diff(['*.js', '*.jsx', '*.mjs', '*.cjs',
+                                            ':!node_modules/*', ':!dist/*',
+                                            ':!*.min.js'])),
+                ('Astro components',  diff(['*.astro'])),
+                ('Style files',       diff(['*.css', '*.scss', '*.sass'])),
+                ('Config/JSON files', diff(['*.json', ':!package-lock.json',
+                                            ':!pnpm-lock.yaml', ':!yarn.lock',
+                                            ':!node_modules/*'])),
+                ('YAML/config files', diff(['*.yml', '*.yaml', '.env.example',
+                                            '.eslintrc*', '.prettierrc*',
+                                            'tsconfig*.json'])),
+                ('Shell scripts',     diff(['*.sh'])),
+                ('Docker files',      diff(['docker-compose*', 'Dockerfile*'])),
+                ('Markdown files',    diff(['*.md', '*.mdx'])),
+            ]
+        elif profile == 'python':
+            sections = [
+                ('Python files',      diff(['*.py', ':!*/__pycache__/*'])),
+                ('Config files',      diff(['*.toml', '*.cfg', '*.ini', '*.txt',
+                                            'requirements*.txt', '.env.example'])),
+                ('YAML/config files', diff(['*.yml', '*.yaml'])),
+                ('Docker files',      diff(['docker-compose*', 'Dockerfile*'])),
+                ('Shell scripts',     diff(['*.sh'])),
+                ('Markdown files',    diff(['*.md'])),
+            ]
+        else:
+            # default: cover everything
+            sections = [
+                ('Python files',      diff(['*.py', ':!*/__pycache__/*'])),
+                ('TypeScript files',  diff(['*.ts', '*.tsx', ':!node_modules/*',
+                                            ':!dist/*', ':!build/*'])),
+                ('JavaScript files',  diff(['*.js', '*.jsx', ':!node_modules/*',
+                                            ':!dist/*', ':!*.min.js'])),
+                ('XML files',         diff(['*.xml'])),
+                ('YAML/config files', diff(['*.yml', '*.yaml', '*.cfg', '*.ini',
+                                            '*.toml', '.env.example'])),
+                ('Shell scripts',     diff(['*.sh'])),
+                ('Docker files',      diff(['docker-compose*', 'Dockerfile*'])),
+                ('Markdown files',    diff(['*.md', '*.mdx'])),
+            ]
 
         limit = 48000
         used  = 0
@@ -111,31 +180,35 @@ runs:
                 break
 
         Path('/tmp/review_diff.txt').write_text('\n'.join(parts))
-        print(f"Diff collected: {used} bytes across {len(parts)} section(s)")
+        print(f"Diff collected: {used} bytes across {len(parts)} section(s) (profile={profile})")
         DIFFEOF
 
-        BASE_BRANCH="${BASE_BRANCH}" python3 - <<'PYEOF'
-        import ast, os, subprocess
+        BASE_BRANCH="${BASE_BRANCH}" PROFILE="${PROFILE}" python3 - <<'PYEOF'
+        import ast, os, re, subprocess
         from pathlib import Path
 
-        base = os.environ.get('BASE_BRANCH', 'main')
-        result = subprocess.run(
+        base    = os.environ.get('BASE_BRANCH', 'main')
+        profile = os.environ.get('PROFILE', 'default')
+
+        # Python convention extraction (docstrings from unchanged methods)
+        py_result = subprocess.run(
             ['git', 'diff', '--name-only', f'origin/{base}...HEAD', '--',
              '*.py', ':!*/static/*', ':!*/__pycache__/*'],
             capture_output=True, text=True,
         )
-        changed = [f for f in result.stdout.strip().splitlines() if f and Path(f).exists()]
+        py_changed = [f for f in py_result.stdout.strip().splitlines() if f and Path(f).exists()]
 
         lines = [
-            '=== Existing docstring conventions in changed files ===',
-            '(Unchanged methods \u2014 these ARE the established convention)',
+            '=== Existing conventions in changed files ===',
+            '(Unchanged code \u2014 these ARE the established conventions for this codebase)',
             '',
         ]
-
         found = False
-        for fpath in changed:
+
+        # Python: extract docstring opening style from existing methods
+        for fpath in py_changed:
             try:
-                src = Path(fpath).read_text()
+                src  = Path(fpath).read_text()
                 tree = ast.parse(src)
                 src_lines = src.splitlines()
             except Exception:
@@ -152,14 +225,45 @@ runs:
             if funcs:
                 found = True
                 lines.append(f'File: {fpath}')
-                lines.extend(funcs[:25])
+                lines.extend(funcs[:20])
                 lines.append('')
 
+        # JS/TS: capture JSDoc and function signatures from unchanged lines
+        if profile in ('react', 'astro', 'node', 'default'):
+            ts_result = subprocess.run(
+                ['git', 'diff', '--name-only', f'origin/{base}...HEAD', '--',
+                 '*.ts', '*.tsx', '*.js', '*.jsx', ':!node_modules/*', ':!dist/*'],
+                capture_output=True, text=True,
+            )
+            ts_changed = [f for f in ts_result.stdout.strip().splitlines() if f and Path(f).exists()]
+
+            jsdoc_re = re.compile(r'/\*\*.*?\*/', re.DOTALL)
+            fn_re    = re.compile(
+                r'(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s+)?\()',
+            )
+            for fpath in ts_changed[:8]:
+                try:
+                    src = Path(fpath).read_text(errors='replace')
+                except Exception:
+                    continue
+                jsdocs = jsdoc_re.findall(src)
+                fns    = fn_re.findall(src)
+                if jsdocs or fns:
+                    found = True
+                    lines.append(f'File: {fpath}')
+                    for doc in jsdocs[:5]:
+                        first_line = doc.strip().split('\n')[0][:120]
+                        lines.append(f'  JSDoc: {first_line}')
+                    for name_a, name_b in fns[:10]:
+                        name = name_a or name_b
+                        lines.append(f'  fn: {name}()')
+                    lines.append('')
+
         if not found:
-            lines.append('(no docstrings found in changed files)')
+            lines.append('(no conventions extracted from changed files)')
 
         Path('/tmp/review_conventions.txt').write_text('\n'.join(lines))
-        print(f"Convention extraction: {len(changed)} file(s) scanned")
+        print(f"Convention extraction: {len(py_changed)} Python + JS/TS files scanned")
         PYEOF
 
         # Collect full current content of changed files so Claude has complete
@@ -172,16 +276,26 @@ runs:
         #   - Python/XML/other: include only if the file is small (< 4 KB)
         #   - Total budget: 20 KB — keeps the prompt manageable
         #   - Deleted files (not present on disk) are skipped automatically
-        BASE_BRANCH="${BASE_BRANCH}" python3 - <<'FULLEOF'
+        BASE_BRANCH="${BASE_BRANCH}" PROFILE="${PROFILE}" python3 - <<'FULLEOF'
         import os, subprocess
         from pathlib import Path
 
         base    = os.environ.get('BASE_BRANCH', 'main')
-        BUDGET    = 20000        # 20 KB total for full file contents
-        PY_MAX    = 4000         # include Python/XML/other only if file is this small
-        ALWAYS    = {'.yml', '.yaml', '.sh', '.bash'}  # always include, but still capped
-        YAML_MAX  = 8000         # per-file cap for YAML/shell to prevent one large action
-                                 # file from consuming the entire budget
+        profile = os.environ.get('PROFILE', 'default')
+
+        BUDGET   = 20000   # 20 KB total for full file contents
+        SMALL    = 4000    # include small code files in full
+        # Always include in full (dense with context, usually small)
+        ALWAYS   = {'.yml', '.yaml', '.sh', '.bash', '.toml', '.cfg',
+                    '.ini', '.env', '.env.example', '.eslintrc', '.prettierrc'}
+        YAML_MAX = 8000    # per-file cap for always-include files
+
+        # Files to skip entirely — generated, locked, or binary
+        SKIP_PATTERNS = {
+            'node_modules', 'dist', 'build', '.next', '.astro',
+            '__pycache__', '.venv', 'venv',
+        }
+        SKIP_EXTS = {'.lock', '.pyc', '.min.js', '.map'}
 
         result = subprocess.run(
             ['git', 'diff', '--diff-filter=AM', '--name-only', f'origin/{base}...HEAD'],
@@ -195,17 +309,31 @@ runs:
         for fpath in changed:
             p   = Path(fpath)
             ext = p.suffix.lower()
+
+            # Skip generated/locked/binary files
+            parts_of_path = set(p.parts)
+            if parts_of_path & SKIP_PATTERNS:
+                continue
+            if ext in SKIP_EXTS:
+                continue
+            # Skip package-lock / pnpm-lock / yarn.lock by name
+            if p.name in ('package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'):
+                continue
+
             try:
                 content = p.read_text(errors='replace')
             except Exception:
                 continue
 
-            # Skip large non-YAML/shell files; they are covered by the diff
-            if ext not in ALWAYS and len(content) > PY_MAX:
-                continue
-            # Cap YAML/shell per-file so one large action file can't exhaust the budget
-            if ext in ALWAYS and len(content) > YAML_MAX:
-                content = content[:YAML_MAX] + '\n... (truncated — file exceeds per-file cap)\n'
+            is_always = (ext in ALWAYS or p.name.startswith('.eslint')
+                         or p.name.startswith('.prettier') or p.name.startswith('tsconfig'))
+
+            if is_always:
+                if len(content) > YAML_MAX:
+                    content = content[:YAML_MAX] + '\n... (truncated — exceeds per-file cap)\n'
+            else:
+                if len(content) > SMALL:
+                    continue  # covered by the diff
 
             remaining = BUDGET - used
             if remaining <= 50:
@@ -314,14 +442,17 @@ runs:
         PR_TITLE: ${{ github.event.pull_request.title }}
         PR_BRANCH: ${{ github.head_ref }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        PROFILE: ${{ steps.profile.outputs.value }}
         SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
       run: |
         python3 - <<'PYEOF'
         import json, os
 
-        ctx   = json.load(open('/tmp/review_context.json'))
-        diff  = open('/tmp/review_diff.txt').read()
-        prev  = ctx['prev_comments']
+        ctx     = json.load(open('/tmp/review_context.json'))
+        diff    = open('/tmp/review_diff.txt').read()
+        prev    = ctx['prev_comments']
+        profile = os.environ.get('PROFILE', 'default')
+
         try:
             conventions = open('/tmp/review_conventions.txt').read()
         except FileNotFoundError:
@@ -334,6 +465,104 @@ runs:
         pending  = [c for c in prev if not c['is_resolved']]
         resolved = [c for c in prev if c['is_resolved']]
 
+        # ------------------------------------------------------------------ #
+        # Profile-specific reviewer persona and checklist
+        # ------------------------------------------------------------------ #
+        PERSONAS = {
+            'odoo':    'senior Odoo developer',
+            'react':   'senior React / TypeScript engineer',
+            'astro':   'senior Astro / frontend engineer',
+            'python':  'senior Python engineer',
+            'node':    'senior Node.js / TypeScript engineer',
+            'default': 'senior software engineer',
+        }
+        persona = PERSONAS.get(profile, PERSONAS['default'])
+
+        CHECKLISTS = {
+            'odoo': [
+                "1. **Correctness** (critical): logic bugs, wrong Odoo API usage, missing super() in CRUD overrides",
+                "2. **Security** (critical): SQL injection via _query(), unsafe eval(), unescaped user input in XML/QWeb",
+                "3. **Odoo model conventions** (critical):",
+                "   - _name/_description must appear before fields in the class body",
+                "   - Many2one fields must end in _id; One2many/Many2many in _ids",
+                "   - compute → _compute_<field>, onchange → _onchange_<field>, constraint → _check_<name>",
+                "   - Button action methods must call self.ensure_one()",
+                "   - Import order: stdlib → odoo → third-party addons",
+                "   - No cr.commit() without an explanatory comment",
+                "   - No bare except without a savepoint",
+                "   - No _() around strings that use % or .format() inside the call",
+                "4. **XML** (critical): IDs must follow <module>.<model>_view_<type>; no hardcoded IDs",
+                "5. **Tests** (warning): new public methods and new code paths must have at least one test",
+                "6. **Manifest** (warning): version bumped, correct depends, all new files listed in data/assets",
+                "7. **Performance** (warning): N+1 queries, missing sudo(), unnecessary iterations",
+                "8. **Field naming** (warning): custom fields must use the module prefix",
+            ],
+            'react': [
+                "1. **Correctness** (critical): logic bugs, incorrect hook calls, stale closures",
+                "2. **Security** (critical): dangerouslySetInnerHTML with unsanitized input, no input validation at API boundaries",
+                "3. **React rules** (critical):",
+                "   - Hooks must only be called at the top level (no hooks inside loops, conditions, or nested functions)",
+                "   - useEffect / useCallback / useMemo dependency arrays must be complete",
+                "   - Async effects must return a cleanup function (AbortController) to prevent updates on unmounted components",
+                "   - Key prop on list items must be stable and unique — never array index when list is reordered",
+                "4. **TypeScript** (critical): no implicit any without justification; all component props must be typed",
+                "5. **Performance** (warning): inline object/array/function literals in JSX break memoization",
+                "6. **Accessibility** (warning): interactive elements must have accessible names",
+                "7. **Tests** (warning): new components and hooks should have at least one test",
+                "8. **No console.log / debugger** (warning) left in production code",
+            ],
+            'astro': [
+                "1. **Correctness** (critical): logic bugs, incorrect use of server vs client context",
+                "2. **Security** (critical): set:html with unsanitized input; server secrets exposed to client",
+                "3. **Astro conventions** (critical):",
+                "   - Server-only code must stay in frontmatter (---)",
+                "   - Dynamic routes must export getStaticPaths() in SSG mode",
+                "   - Content collection schemas must match frontmatter fields",
+                "4. **TypeScript** (critical): all props and data shapes must be typed",
+                "5. **Performance** (warning): use client:idle or client:visible instead of client:load where possible",
+                "6. **Images** (warning): use Astro's <Image> component for local images",
+                "7. **Accessibility** (warning): interactive elements need accessible names",
+                "8. **No console.log / debugger** (warning) left in production code",
+            ],
+            'python': [
+                "1. **Correctness** (critical): logic bugs, incorrect exception handling, resource leaks",
+                "2. **Security** (critical): SQL string interpolation, eval/exec on untrusted input, hardcoded secrets",
+                "3. **Python conventions** (critical):",
+                "   - No bare except; catch specific exceptions",
+                "   - Use context managers (with) for files, connections, and locks",
+                "   - No mutable default arguments",
+                "4. **Type hints** (warning): public functions must have parameter and return type annotations",
+                "5. **Tests** (warning): new public functions and business logic must have at least one test",
+                "6. **Logging** (warning): no print() in production code; use logging module",
+                "7. **Dependencies** (warning): new packages must be added to requirements files or pyproject.toml",
+            ],
+            'node': [
+                "1. **Correctness** (critical): unhandled promise rejections, fire-and-forget async, logic bugs",
+                "2. **Security** (critical): eval/new Function on untrusted input, SQL string interpolation, hardcoded secrets, no input validation",
+                "3. **TypeScript** (critical): no implicit any; strict mode required",
+                "4. **Error handling** (critical): every async function must have try/catch or .catch(); no silent failure",
+                "5. **Tests** (warning): new logic paths must have at least one test",
+                "6. **No console.log / debugger** (warning) left in production code",
+                "7. **Dependencies** (warning): new packages must be in package.json; no star/latest versions",
+                "8. **Env vars** (warning): all env vars must be documented in .env.example",
+            ],
+        }
+        base_checks = [
+            "A. **YAML workflows** (warning): secret names must match org standard; minimal permissions per job; no hardcoded secrets",
+            "B. **Docker / docker-compose** (warning): no hardcoded credentials; sensible volume mounts; no deprecated syntax",
+            "C. **Shell scripts** (warning): must start with set -euo pipefail; variables must be quoted; no silent pipe failures",
+            "D. **Config files** (warning): required fields present; values consistent with repo structure",
+        ]
+        checklist = CHECKLISTS.get(profile, [
+            "1. **Correctness** (critical): logic bugs, incorrect error handling, resource leaks",
+            "2. **Security** (critical): injection, hardcoded secrets, untrusted input not validated",
+            "3. **Conventions** (warning): follow established patterns visible in the codebase",
+            "4. **Tests** (warning): new logic should have at least one test",
+        ]) + base_checks
+
+        # ------------------------------------------------------------------ #
+        # Follow-up / stateful context block
+        # ------------------------------------------------------------------ #
         if prev:
             context_block = '\n'.join([
                 f"This is a follow-up review. You previously left {len(prev)} comment(s):",
@@ -344,30 +573,45 @@ runs:
                 f"Already resolved: {len(resolved)}",
                 "",
                 "FOLLOW-UP RULES \u2014 strictly enforced:",
-                "- **MANDATORY**: Generate a reply_to entry for EVERY pending comment above \u2014 no exceptions, no omissions.",
-                "  For each comment_id in the pending list: check the current diff and either mark resolved=true (fixed) or resolved=false (still present).",
-                "- Pending issue NOW FIXED in the diff below \u2192 reply_to with resolved=true",
-                "- Pending issue STILL PRESENT and unchanged \u2192 reply_to with resolved=false; do NOT create a new_comment at that location",
-                "- Only genuinely NEW issues (not in the list above) go in new_comments",
+                "- MANDATORY: generate a reply_to entry for EVERY pending comment — no exceptions.",
+                "  For each comment_id: check the current diff and mark resolved=true (fixed) or resolved=false (still present).",
+                "- Pending issue FIXED in the current diff \u2192 reply_to with resolved=true",
+                "- Pending issue STILL PRESENT, unchanged \u2192 reply_to with resolved=false; do NOT create a duplicate new_comment at that location",
+                "- Only genuinely NEW issues (not in the pending list) go in new_comments",
                 "- NEVER duplicate a new_comment at a (path, line) that already has a pending comment",
-                "- NEVER approve while any pending issue remains unresolved",
-                "- Be consistent: if code was wrong before and has not changed, it is still wrong",
-                "- **RESOLVED THREADS ARE CLOSED DECISIONS**: a resolved comment means the developer reviewed",
-                "  your feedback and deliberately chose the current code. Do NOT re-flag the same pattern,",
-                "  file, or concern from a resolved thread — doing so causes infinite review loops.",
-                "  If you believe a resolved issue hides a critical bug, note it ONCE in new_comments with",
-                "  explicit reasoning; do not repeat the same comment on subsequent pushes.",
+                "- NEVER approve while any critical pending issue remains unresolved",
+                "- RESOLVED THREADS ARE CLOSED DECISIONS: a resolved thread means the developer",
+                "  reviewed your feedback and deliberately chose the current code. Do NOT re-flag",
+                "  the same pattern, file, or concern from a resolved thread on any future push.",
+                "  This is the primary cause of infinite review loops — avoid it.",
+                "  Exception: if a resolved thread hides a critical security or correctness bug,",
+                "  you may flag it ONCE in new_comments with explicit reasoning. Never repeat it.",
+                "- LOOP PREVENTION: do not request cosmetic changes (formatting, style preferences)",
+                "  more than once. If the developer kept the original style, accept it.",
             ])
         else:
             context_block = "This is the first review of this PR."
 
+        # ------------------------------------------------------------------ #
+        # Assemble prompt
+        # ------------------------------------------------------------------ #
+        guidelines_note = {
+            'odoo':    'The Odoo coding guidelines and git guidelines are loaded in your system prompt — apply them strictly.',
+            'react':   'The JavaScript/TypeScript/React guidelines are loaded in your system prompt — apply them strictly.',
+            'astro':   'The JavaScript/TypeScript/Astro guidelines are loaded in your system prompt — apply them strictly.',
+            'python':  'The Python best practices and git guidelines are loaded in your system prompt.',
+            'node':    'The JavaScript/TypeScript/Node.js guidelines are loaded in your system prompt — apply them strictly.',
+            'default': 'The git guidelines are loaded in your system prompt.',
+        }.get(profile, '')
+
         prompt_parts = [
-            "You are a senior Odoo developer performing a code review.",
-            "The Odoo coding guidelines and git guidelines are already included in your system prompt \u2014 apply them strictly.",
+            f"You are a {persona} performing a code review.",
+            guidelines_note,
             "",
             f"PR title: {os.environ['PR_TITLE']}",
             f"Branch:   {os.environ['PR_BRANCH']}",
             f"Author:   {os.environ['PR_AUTHOR']}",
+            f"Profile:  {profile}",
             "",
             context_block,
             "",
@@ -378,21 +622,19 @@ runs:
                 conventions,
                 "",
                 "CONVENTION CHECK \u2014 strictly enforced:",
-                "Before flagging ANY formatting or style issue, look for the same pattern in the",
-                "'Existing conventions' section above. If an unchanged method uses the same pattern,",
-                "it IS the established convention for this codebase \u2014 mark it as correct, not an issue.",
-                "This applies to: docstring opening style, Note: self.ensure_one() lines, param/return",
-                "formatting, or any other style detail that appears in at least one existing method.",
+                "Before flagging ANY style or formatting issue, look for the same pattern in",
+                "the 'Existing conventions' section above. If unchanged code uses the same",
+                "pattern, it IS the established convention for this codebase — accept it.",
+                "Do NOT flag style preferences that are already consistently applied.",
                 "",
             ]
 
         if full_files:
             prompt_parts += [
                 "=== FULL CURRENT FILE CONTENTS ===",
-                "These are the COMPLETE current contents of every changed file (not just the diff).",
-                "Read these FIRST before reviewing the diff below.",
-                "Any declaration, assignment, or block visible here is present in the current code —",
-                "do NOT flag it as missing just because it does not appear in the diff hunk.",
+                "These are the COMPLETE current file contents (not just the diff).",
+                "Read these FIRST. Any declaration visible here is present in the code —",
+                "do NOT flag it as missing just because it is outside the diff hunk.",
                 "",
                 full_files,
                 "",
@@ -404,66 +646,45 @@ runs:
             diff,
             "```",
             "",
-            "Review checklist (apply Odoo coding guidelines strictly for each point):",
-            "1. Correctness: logic bugs, wrong Odoo API usage, missing super() calls in CRUD overrides",
-            "2. Security: SQL injection, unsafe eval(), unescaped user input in XML/QWeb",
-            "3. Odoo model conventions (flag as CHANGES_REQUESTED):",
-            "   - Wrong attribute order: _name/_description must come before fields",
-            "   - Field suffixes: Many2one must end in _id, One2many/Many2many in _ids",
-            "   - compute methods must be named _compute_<field_name>",
-            "   - onchange methods must be named _onchange_<field_name>",
-            "   - constraint methods must be named _check_<name>",
-            "   - action methods (called from buttons) must call self.ensure_one()",
-            "   - Imports must follow order: stdlib \u2192 odoo \u2192 third-party addons",
-            "   - No cr.commit() without explicit justification in a comment",
-            "   - No bare except Exception without savepoints",
-            "   - No _() around strings with % or .format() interpolation inside the call",
-            "4. XML conventions (flag as CHANGES_REQUESTED):",
-            "   - XML IDs must follow pattern: <module>.<model>_view_<type>",
-            "   - No hardcoded IDs; use ref() for cross-module references",
-            "5. Test coverage: missing tests for new public methods or new code paths",
-            "6. Manifest: version bump, correct depends, all new files listed in data/assets",
-            "7. Performance: N+1 queries, missing sudo() where appropriate, unnecessary iterations",
-            "8. Field naming: custom fields must use module prefix (e.g. bancard_public_key)",
-            "9. YAML workflow files (.github/workflows/*.yml):",
-            "   - Secret names must match org standard: UNIFOX_CI_APP_ID, UNIFOX_CI_PRIVATE_KEY, ANTHROPIC_API_KEY",
-            "   - Action refs must be consistent (@main or a pinned version, not mixed)",
-            "   - permissions blocks must be minimal (only what the job actually needs)",
-            "   - Workflow triggers must make sense for the job's purpose",
-            "   - Flag any hardcoded values that should be secrets or inputs",
-            "10. docker-compose and Dockerfile:",
-            "    - No hardcoded credentials or sensitive values",
-            "    - Volume mounts must make sense and not expose the host unnecessarily",
-            "    - Flag deprecated syntax",
-            "11. Shell scripts (.sh):",
-            "    - Missing error handling: scripts must start with 'set -e' and 'set -o pipefail' (or equivalent)",
-            "    - Commands that can fail silently (pipes without error propagation)",
-            "    - Variables must be quoted to avoid word splitting",
-            "12. .unifox.yml and other config files:",
-            "    - Required fields must be present",
-            "    - Values must be consistent with the repo's actual structure",
+            "## Review checklist",
             "",
-            'Output ONLY a valid JSON object:',
+            "\n".join(checklist),
+            "",
+            "## Severity levels",
+            "- **critical** \u2192 must be fixed before merge; triggers CHANGES_REQUESTED",
+            "  Examples: security vulnerabilities, logic bugs, broken API contracts, violations of the critical items above",
+            "- **warning** \u2192 important but not blocking; appears in the PR summary",
+            "  Examples: missing tests, performance concerns, incomplete docs, style violations",
+            "- **suggestion** \u2192 take-it-or-leave-it improvement; listed briefly in summary",
+            "  Examples: readability, naming preferences, minor optimizations",
+            "  IMPORTANT: do NOT create inline comments for suggestions — put them in the summary text only.",
+            "",
+            "## Output format",
+            "",
+            "Output ONLY a valid JSON object (no markdown fences, no explanation outside JSON):",
             '{',
             '  "verdict": "APPROVED" | "CHANGES_REQUESTED" | "COMMENT",',
-            '  "summary": "1-3 sentence cumulative summary. If follow-up: mention resolved vs pending count.",',
-            '  "new_comments": [{"path": "file.py", "line": 42, "body": "Issue"}],',
+            '  "summary": "2-4 sentence summary. If follow-up: mention resolved vs still-pending. Mention warnings and suggestions briefly in prose — do NOT list them as separate comments.",',
+            '  "new_comments": [',
+            '    {"path": "file.py", "line": 42, "severity": "critical" | "warning", "body": "Concise issue + why it matters + suggested fix"}',
+            '  ],',
             '  "reply_to": [{"comment_id": 123456, "body": "Reply text", "resolved": true}]',
             '}',
             "",
-            "Rules:",
-            "- verdict=APPROVED only if zero pending issues and no new blocking issues",
-            "- verdict=CHANGES_REQUESTED if any item from checklist points 1-4 is violated",
-            "- verdict=COMMENT for non-blocking suggestions only",
-            "- new_comments: max 8 items, new issues only",
-            "- reply_to: one entry per previous comment that needs follow-up action",
-            "- All text in English \u2014 no markdown fences outside the JSON",
-            "- PR title scope may be a directory path such as '.github' or 'unifica_payment' \u2014 do NOT flag dots or underscores in scope names as invalid",
+            "## Output rules",
+            "- verdict=APPROVED: zero pending critical issues AND no new critical issues",
+            "- verdict=CHANGES_REQUESTED: one or more critical issues pending or new",
+            "- verdict=COMMENT: only warnings / suggestions, nothing critical",
+            "- new_comments: max 5 items, critical and warning severity ONLY",
+            "  Suggestions must go in the summary text, never as inline comments",
+            "- reply_to: one entry per previous pending comment (mandatory)",
+            "- All text in English",
+            "- PR title scope may contain dots, underscores, slashes (e.g. '.github', 'unifica_payment') — do NOT flag these as invalid",
+            "- Do not flag TODO comments unless they have been there for multiple PRs",
+            "- Do not flag formatting/style that matches the existing codebase convention",
         ]
 
-        # Auto-approve only when the diff is genuinely empty (no files of any type changed)
-        # and there are no prior pending issues. YAML, shell, docker, config files all
-        # warrant a real review — only skip Claude when there is truly nothing to review.
+        # Auto-approve only when the diff is genuinely empty and no pending critical issues.
         if not diff.strip() and not pending:
             import json as _json
             _json.dump({
@@ -472,16 +693,17 @@ runs:
                 'new_comments': [],
                 'reply_to': [],
             }, open('/tmp/review_parsed.json', 'w'))
-            print("Diff is genuinely empty and no pending issues — auto-approved, skipping Claude call")
+            print("Diff is empty and no pending issues — auto-approved, skipping Claude call")
         else:
             prompt_text = '\n'.join(prompt_parts)
             open('/tmp/review_prompt.txt', 'w').write(prompt_text)
-            print(f"Prompt written ({len(prompt_text)} chars), follow-up={bool(prev)}")
+            print(f"Prompt written ({len(prompt_text)} chars), profile={profile}, follow-up={bool(prev)}")
 
         PYEOF
 
         if [ ! -f /tmp/review_parsed.json ]; then
-          python "${SCRIPTS_DIR}/claude_api.py" < /tmp/review_prompt.txt > /tmp/review_raw.json
+          UNIFOX_PROFILE="${PROFILE}" python "${SCRIPTS_DIR}/claude_api.py" \
+            < /tmp/review_prompt.txt > /tmp/review_raw.json
         fi
 
         python3 - <<'PYEOF'
@@ -508,8 +730,32 @@ runs:
         data.setdefault('new_comments', [])
         data.setdefault('reply_to', [])
 
+        # Enforce: suggestions must NOT appear as inline comments.
+        # If Claude accidentally put severity=suggestion as inline, demote it.
+        inline_comments = []
+        for c in data['new_comments']:
+            sev = c.get('severity', 'warning')
+            if sev == 'suggestion':
+                # Move to summary (we'll note it in the summary step)
+                continue
+            inline_comments.append(c)
+        # Cap at 5 inline comments — highest severity first
+        SEV_ORDER = {'critical': 0, 'warning': 1}
+        inline_comments.sort(key=lambda c: SEV_ORDER.get(c.get('severity', 'warning'), 1))
+        data['new_comments'] = inline_comments[:5]
+
+        # Re-evaluate verdict: CHANGES_REQUESTED only if there are critical issues
+        has_critical = any(c.get('severity') == 'critical' for c in data['new_comments'])
+        pending_critical = any(
+            c.get('severity') == 'critical'
+            for c in (data.get('reply_to') or [])
+            if not c.get('resolved', True)
+        )
+        if data['verdict'] == 'CHANGES_REQUESTED' and not has_critical and not pending_critical:
+            data['verdict'] = 'COMMENT'
+
         json.dump(data, open('/tmp/review_parsed.json', 'w'), indent=2)
-        print(f"Verdict: {data['verdict']}, new_comments: {len(data['new_comments'])}, reply_to: {len(data['reply_to'])}")
+        print(f"Verdict: {data['verdict']}, inline: {len(data['new_comments'])}, reply_to: {len(data['reply_to'])}")
         PYEOF
 
     - name: Execute review actions
@@ -639,27 +885,47 @@ runs:
             parts.append(f'{now_pending} pending')
         if new_count:
             parts.append(f'{new_count} new')
-        status = ' \u00b7 '.join(parts) if parts else 'No issues found'
+        status_str = ' \u00b7 '.join(parts) if parts else 'no issues'
 
-        rev_body = '\n'.join([
+        verdict = data.get('verdict', 'COMMENT')
+        verdict_icon = {
+            'APPROVED': '\u2705',
+            'CHANGES_REQUESTED': '\u274c',
+            'COMMENT': '\U0001f4ac',
+        }.get(verdict, '\U0001f4ac')
+
+        rev_body_parts = [
             '<!-- unifox-review -->',
+            '',
+            f'{verdict_icon} **{verdict.replace("_", " ").title()}**',
             '',
             data.get('summary', ''),
             '',
-            f'**Issues:** {status}',
-        ])
+            f'**Issues:** {status_str}',
+        ]
+
+        rev_body = '\n'.join(rev_body_parts)
 
         event_map = {
             'APPROVED':          'APPROVE',
             'CHANGES_REQUESTED': 'REQUEST_CHANGES',
             'COMMENT':           'COMMENT',
         }
-        event  = event_map.get(data.get('verdict', 'COMMENT'), 'COMMENT')
-        inline = [
-            {'path': c['path'], 'line': c['line'], 'body': c['body'], 'side': 'RIGHT'}
-            for c in data.get('new_comments', [])
-            if c.get('path') and isinstance(c.get('line'), int) and c.get('body')
-        ]
+        event = event_map.get(data.get('verdict', 'COMMENT'), 'COMMENT')
+
+        SEV_PREFIX = {
+            'critical':   '\U0001f534 **Critical**',
+            'warning':    '\U0001f7e1 **Warning**',
+            'suggestion': '\U0001f4a1 **Suggestion**',
+        }
+        inline = []
+        for c in data.get('new_comments', []):
+            if not (c.get('path') and isinstance(c.get('line'), int) and c.get('body')):
+                continue
+            sev    = c.get('severity', 'warning')
+            prefix = SEV_PREFIX.get(sev, SEV_PREFIX['warning'])
+            body   = f"{prefix}: {c['body']}"
+            inline.append({'path': c['path'], 'line': c['line'], 'body': body, 'side': 'RIGHT'})
 
         payload = {'commit_id': sha, 'body': rev_body, 'event': event, 'comments': inline}
         r = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')

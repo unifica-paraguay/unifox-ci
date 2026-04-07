@@ -1,0 +1,53 @@
+# unifox-ci profile: python
+# Rules for Python services, APIs, and packages (non-Odoo).
+
+name: python
+description: "Profile for Python services and packages"
+
+guidelines:
+  - git_guidelines.rst
+
+branch_pattern: ".*"
+branch_hint: "No specific branch naming convention enforced"
+
+module_manifest: null
+module_prefix: null
+
+version_format: "semver"
+
+linters:
+  - flake8
+  - mypy   # optional: only runs if mypy is configured
+
+test_runner: pytest
+test_command: "python -m pytest --tb=short -q"
+
+diff_patterns:
+  - "*.py"
+  - "*.toml"
+  - "*.cfg"
+  - "*.ini"
+  - "*.env.example"
+  - "*.txt"   # requirements.txt
+
+diff_exclude:
+  - "__pycache__/*"
+  - "*.pyc"
+  - ".venv/*"
+  - "venv/*"
+  - "*.egg-info/*"
+  - "dist/*"
+  - "build/*"
+
+review_focus:
+  - "Type hints: all public functions and methods should have return type and parameter type annotations"
+  - "Exception handling: avoid bare except; catch specific exceptions"
+  - "Resource management: use context managers (with) for files, DB connections, HTTP sessions"
+  - "Security: no eval(), exec(), or pickle.loads() on untrusted input"
+  - "Security: use parameterized queries for all DB access — no string interpolation in SQL"
+  - "Security: no hardcoded secrets, passwords, or API keys"
+  - "No print() statements left in production code — use logging"
+  - "No mutable default arguments (def f(x=[]) is a common bug)"
+  - "Async: do not block the event loop with synchronous I/O in async functions"
+  - "Tests: all new public functions and business logic must have at least one test"
+  - "Dependencies: new packages must be added to requirements files or pyproject.toml"

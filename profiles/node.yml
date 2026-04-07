@@ -1,0 +1,54 @@
+# unifox-ci profile: node
+# Rules for generic Node.js backends, CLIs, and packages.
+
+name: node
+description: "Profile for Node.js backends and packages"
+
+guidelines:
+  - git_guidelines.rst
+  - js_guidelines.md
+
+branch_pattern: ".*"
+branch_hint: "No specific branch naming convention enforced"
+
+module_manifest: null
+module_prefix: null
+
+version_format: "semver"
+
+linters:
+  - eslint
+  - tsc   # only if tsconfig.json is present
+
+test_runner: node
+test_command: "npm test"
+test_command_pnpm: "pnpm test"
+test_command_yarn: "yarn test"
+
+diff_patterns:
+  - "*.ts"
+  - "*.js"
+  - "*.json"
+  - "*.env.example"
+
+diff_exclude:
+  - "node_modules/*"
+  - "dist/*"
+  - "build/*"
+  - "*.min.js"
+  - "*.lock"
+  - "package-lock.json"
+  - "pnpm-lock.yaml"
+
+review_focus:
+  - "No console.log / debugger / TODO left in production code"
+  - "Error handling: async functions must have try/catch or .catch(); promises must not be fire-and-forget"
+  - "Security: no eval() or new Function() on untrusted input"
+  - "Security: use parameterized queries — no string interpolation in SQL"
+  - "Security: validate and sanitize all user input at API boundaries"
+  - "Security: no hardcoded secrets, tokens, or passwords"
+  - "TypeScript: prefer strict mode; no explicit any without justification"
+  - "Dependency management: new packages must be added to package.json"
+  - "Tests: new logic paths must have at least one test"
+  - "Async: prefer async/await over raw Promise chains for readability"
+  - "Environment variables: all env vars must be documented in .env.example"

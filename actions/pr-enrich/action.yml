@@ -23,9 +23,9 @@ inputs:
     required: false
     default: "synchronize"
   profile:
-    description: "Repository profile (odoo, default)"
+    description: "Repository profile (odoo, react, astro, python, node, default, auto)"
     required: false
-    default: "default"
+    default: "auto"
 
 runs:
   using: "composite"
@@ -61,15 +61,62 @@ runs:
       shell: bash
       run: pip install requests
 
+    - name: Detect profile
+      id: profile
+      shell: bash
+      env:
+        PROFILE_INPUT: ${{ inputs.profile }}
+      run: |
+        chmod +x "${{ github.action_path }}/../../scripts/detect_framework.sh"
+        if [ "$PROFILE_INPUT" = "auto" ] || [ -z "$PROFILE_INPUT" ]; then
+          PROFILE=$("${{ github.action_path }}/../../scripts/detect_framework.sh" .)
+          echo "Auto-detected profile: $PROFILE"
+        else
+          PROFILE="$PROFILE_INPUT"
+          echo "Using explicit profile: $PROFILE"
+        fi
+        echo "value=${PROFILE}" >> "$GITHUB_OUTPUT"
+
     - name: Collect diff for metadata
       shell: bash
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
+        PROFILE: ${{ steps.profile.outputs.value }}
       run: |
         git fetch origin "$BASE_BRANCH"
-        git diff "origin/${BASE_BRANCH}...HEAD" -- \
-          '*.py' '*__manifest__.py' '*.xml' \
-          | head -c 32000 > /tmp/pr_diff.txt
+
+        # Build a profile-aware diff that captures the most relevant files.
+        python3 - <<'PYEOF'
+        import os, subprocess
+        from pathlib import Path
+
+        base    = os.environ['BASE_BRANCH']
+        profile = os.environ.get('PROFILE', 'default')
+
+        def diff(*patterns):
+            args = ['git', 'diff', f'origin/{base}...HEAD', '--'] + list(patterns)
+            r = subprocess.run(args, capture_output=True, text=True)
+            return r.stdout
+
+        if profile == 'odoo':
+            content = diff('*.py', '*__manifest__.py', '*.xml')
+        elif profile in ('react', 'astro', 'node'):
+            content = diff('*.ts', '*.tsx', '*.js', '*.jsx', '*.astro',
+                           ':!node_modules/*', ':!dist/*', ':!build/*',
+                           ':!*.min.js', ':!package-lock.json')
+        elif profile == 'python':
+            content = diff('*.py', ':!*/__pycache__/*', '*.toml', 'requirements*.txt')
+        else:
+            content = diff('*.py', '*.ts', '*.tsx', '*.js', '*.jsx',
+                           ':!node_modules/*', ':!*/__pycache__/*')
+
+        # Hard cap at 32 KB
+        out = content[:32000]
+        if len(content) > 32000:
+            out += '\n... (truncated)\n'
+        Path('/tmp/pr_diff.txt').write_text(out)
+        print(f"Diff collected: {len(out)} bytes (profile={profile})")
+        PYEOF
 
     - name: Generate or refresh title and description
       shell: bash
@@ -80,16 +127,34 @@ runs:
         PR_BRANCH: ${{ github.head_ref }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         EVENT_ACTION: ${{ github.event.action }}
+        PROFILE: ${{ steps.profile.outputs.value }}
         SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
       run: |
         DIFF=$(cat /tmp/pr_diff.txt)
         COMMITS=$(git log "origin/${{ inputs.base_branch }}..HEAD" --oneline)
 
-        PROMPT="You are reviewing a pull request for an Odoo addons repository.
+        # Profile-specific repo description
+        REPO_DESC=""
+        if [ "$PROFILE" = "odoo" ]; then
+          REPO_DESC="Odoo addons repository"
+        elif [ "$PROFILE" = "react" ]; then
+          REPO_DESC="React / Next.js frontend repository"
+        elif [ "$PROFILE" = "astro" ]; then
+          REPO_DESC="Astro site repository"
+        elif [ "$PROFILE" = "python" ]; then
+          REPO_DESC="Python service / package repository"
+        elif [ "$PROFILE" = "node" ]; then
+          REPO_DESC="Node.js backend repository"
+        else
+          REPO_DESC="software repository"
+        fi
+
+        PROMPT="You are reviewing a pull request for a ${REPO_DESC}.
 
         Event: ${EVENT_ACTION} (opened = first time, synchronize = new push, reopened = reopened)
         PR branch: ${PR_BRANCH}
         PR author: ${PR_AUTHOR}
+        Profile: ${PROFILE}
 
         Current title: ${PR_TITLE}
         Current description:
@@ -108,23 +173,24 @@ runs:
         Rules:
         - If the current title and description are already accurate and complete, output exactly:
           NO_UPDATE
-        - If the title or description is missing information, outdated, or inaccurate given the
-          current diff, output ONLY a JSON object:
+        - If the title or description is missing information, outdated, or inaccurate, output ONLY:
           {
             \"title\": \"[TAG] scope: short description in English (imperative, < 72 chars)\",
             \"body\": \"<full description following the template below>\"
           }
 
-        Title format — STRICTLY follow Odoo git guidelines:
+        Title format — STRICTLY follow the org git guidelines:
           [TAG] scope: short description in English
         Valid tags: [ADD] [FIX] [UPD] [REF] [REM] [MOV] [IMP] [REL] [MERGE] [REV] [CLN] [LINT] [PERF] [I18N] [CLA]
-        Scope is the module technical name or area (e.g. unifica_payment_bancard, .github, unifica_base).
-        Description is imperative mood, < 72 chars total for the entire title.
+        Scope is the module name, package name, or main area affected (e.g. unifica_payment, auth, ui, api, .github).
+        Description is imperative mood, total title < 72 chars.
         Examples:
           [IMP] unifica_payment_bancard: complete docstrings for billing methods
+          [FIX] auth: fix token refresh race condition
+          [ADD] ui: add mobile checkout layout
+          [REF] api: extract validation into shared helper
           [FIX] .github: fix workflow triggers and secret names
-          [ADD] unifica_base: add module filter views
-        NEVER use Conventional Commits format (feat:, fix:, chore:) — use the [TAG] format above.
+        NEVER use Conventional Commits format (feat:, fix:, chore:) — always use the [TAG] format above.
 
         Description template (English only):
         ## Purpose
@@ -136,12 +202,13 @@ runs:
         - Group minor related changes under the same bullet
 
         ## Notes
-        (Only if needed: breaking changes, migration steps, dependencies, or anything
-        the reviewer must know before approving. Omit this section entirely if not needed.)
+        (Only if needed: breaking changes, migration steps, env var changes, dependencies,
+        or anything the reviewer must know before approving. Omit entirely if not needed.)
 
         No markdown fences around the JSON. No explanation outside the JSON or NO_UPDATE."
 
-        python "${SCRIPTS_DIR}/claude_api.py" "$PROMPT" > /tmp/claude_meta_raw.txt
+        UNIFOX_PROFILE="${PROFILE}" python "${SCRIPTS_DIR}/claude_api.py" \
+          "$PROMPT" > /tmp/claude_meta_raw.txt
         cat /tmp/claude_meta_raw.txt
 
     - name: Apply title/description update if needed
@@ -198,10 +265,15 @@ runs:
       shell: bash
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
+        PROFILE: ${{ steps.profile.outputs.value }}
       run: |
-        chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
-        MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
-        echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        if [ "$PROFILE" = "odoo" ]; then
+          chmod +x "${{ github.action_path }}/../../scripts/detect_modules.sh"
+          MODS=$("${{ github.action_path }}/../../scripts/detect_modules.sh" "$BASE_BRANCH")
+          echo "modules=${MODS}" >> "$GITHUB_OUTPUT"
+        else
+          echo "modules=" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Choose reviewers
       id: reviewers
@@ -210,25 +282,30 @@ runs:
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
         PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        PR_BRANCH: ${{ github.head_ref }}
         MODULES: ${{ steps.detect.outputs.modules }}
+        PROFILE: ${{ steps.profile.outputs.value }}
         SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
       run: |
-        PROMPT="A pull request was opened in an Odoo addons repository.
+        PROMPT="A pull request was opened in a ${PROFILE} repository.
 
         Author: ${PR_AUTHOR}
-        Modified Odoo modules: ${MODULES:-none}
+        Branch: ${PR_BRANCH}
+        Modified modules/areas: ${MODULES:-none detected}
 
         Available reviewers:
-        - weckerleben (lead, payment & CI)
+        - weckerleben (tech lead, owns payment integrations, CI, and architecture decisions)
 
         Rules:
         - Never assign the author as reviewer.
         - Assign 1-2 reviewers max.
-        - Prefer weckerleben for payment modules; assign by default if no specialty match.
+        - weckerleben is the default reviewer for all PRs in the org.
+        - Only skip weckerleben if the PR author IS weckerleben.
 
         Output ONLY a JSON object: {\"reviewers\": [\"username\"]}. No markdown, no explanation."
 
-        python "${SCRIPTS_DIR}/claude_api.py" "$PROMPT" > /tmp/reviewers_raw.json
+        UNIFOX_PROFILE="${PROFILE}" python "${SCRIPTS_DIR}/claude_api.py" \
+          "$PROMPT" > /tmp/reviewers_raw.json
 
         python3 - <<'PYEOF'
         import json
