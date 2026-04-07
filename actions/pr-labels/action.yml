@@ -1,10 +1,16 @@
-name: "unifox-ci: PR Auto Labels"
+name: "unifox-ci: AI Auto Labels"
 description: >
-  Automatically assigns labels to a PR based on: PR size (XS/S/M/L/XL),
-  change type (feature/fix/docs/ci/test/refactor), and affected areas.
-  Creates labels if they do not exist. Updates existing labels on re-runs.
+  Assigns labels to a PR using a two-pass strategy:
+    Pass 1 (deterministic) — size label from line count, type label from [TAG].
+    Pass 2 (AI) — Claude reads the full PR context and picks area labels
+                  from a fixed canonical catalog. No labels are invented.
+  Creates labels if they don't exist yet. Removes stale bot-managed labels
+  on each re-run. Never creates duplicates or off-catalog labels.
 
 inputs:
+  anthropic_api_key:
+    description: "Anthropic API key"
+    required: true
   unifox_app_id:
     description: "unifox-ci GitHub App ID"
     required: true
@@ -40,7 +46,12 @@ runs:
       with:
         python-version: "3.11"
 
-    - name: Compute and apply labels
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests -q
+
+    - name: Pass 1 — deterministic labels (size + type)
+      id: deterministic
       shell: bash
       env:
         GH_TOKEN: ${{ steps.token.outputs.value }}
@@ -48,21 +59,55 @@ runs:
         REPO: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PR_TITLE: ${{ github.event.pull_request.title }}
-        PR_BRANCH: ${{ github.head_ref }}
       run: |
         python3 - <<'PYEOF'
         import json, os, re, subprocess
-        from pathlib import Path
 
-        repo      = os.environ['REPO']
-        pr        = os.environ['PR_NUMBER']
-        base      = os.environ['BASE_BRANCH']
-        pr_title  = os.environ.get('PR_TITLE', '')
-        pr_branch = os.environ.get('PR_BRANCH', '')
+        repo     = os.environ['REPO']
+        pr       = os.environ['PR_NUMBER']
+        base     = os.environ['BASE_BRANCH']
+        title    = os.environ.get('PR_TITLE', '')
 
         # ------------------------------------------------------------------ #
-        # Helpers
+        # Canonical label catalog
+        # Every label here WILL be created if missing.
+        # format: name → (hex_color, description)
         # ------------------------------------------------------------------ #
+        CATALOG = {
+            # ── size (deterministic) ──────────────────────────────────────
+            'size: xs':       ('b2dfdb', 'Extra-small PR — < 50 lines changed'),
+            'size: s':        ('86d18e', 'Small PR — 50–200 lines changed'),
+            'size: m':        ('fbca04', 'Medium PR — 200–500 lines changed'),
+            'size: l':        ('f99b2e', 'Large PR — 500–1000 lines changed'),
+            'size: xl':       ('e11d48', 'Very large PR — > 1000 lines changed'),
+            # ── type (deterministic from [TAG]) ───────────────────────────
+            'type: feature':  ('a2eeef', 'New feature or capability [ADD] [IMP]'),
+            'type: fix':      ('d73a4a', 'Bug fix [FIX]'),
+            'type: refactor': ('cfd3d7', 'Code restructuring without behavior change [REF] [CLN]'),
+            'type: chore':    ('e4e669', 'Maintenance — deps, tooling, config [UPD] [REM] [MOV] [LINT] [CHORE]'),
+            'type: perf':     ('00b4d8', 'Performance improvement [PERF]'),
+            'type: release':  ('0e8a16', 'Release commit [REL]'),
+            'type: revert':   ('b60205', 'Reverts a previous commit [REV]'),
+            'type: i18n':     ('bfd4f2', 'Translation / internationalisation [I18N]'),
+            'type: docs':     ('0075ca', 'Documentation only [DOCS]'),
+            'type: test':     ('d4c5f9', 'Test additions or changes [TEST]'),
+            'type: security': ('e11d48', 'Security fix or hardening [SEC]'),
+            'type: ci':       ('f9d0c4', 'CI/CD pipeline changes [CI]'),
+            # ── area (AI-assigned from this exact list) ───────────────────
+            'area: frontend': ('ff6b6b', 'UI, components, styles'),
+            'area: backend':  ('ffd166', 'Server-side logic, services'),
+            'area: api':      ('06d6a0', 'HTTP API, routes, controllers'),
+            'area: database': ('118ab2', 'Migrations, schema, ORM models'),
+            'area: auth':     ('b60205', 'Authentication, authorisation, permissions'),
+            'area: payments': ('0e8a16', 'Payment integrations'),
+            'area: ci/cd':    ('e4e669', 'GitHub Actions, deployment pipelines'),
+            'area: config':   ('cfd3d7', 'Configuration files, environment variables'),
+            'area: tests':    ('d4c5f9', 'Test files'),
+            'area: docs':     ('0075ca', 'Documentation files'),
+            'area: security': ('e11d48', 'Security-sensitive code paths'),
+            'area: infra':    ('8a2be2', 'Docker, servers, infrastructure'),
+        }
+
         def gh(endpoint, body=None, method='GET'):
             cmd = ['gh', 'api']
             if method != 'GET':
@@ -73,147 +118,293 @@ runs:
             kw = {'capture_output': True, 'text': True}
             if body is not None:
                 kw['input'] = json.dumps(body)
-            r = subprocess.run(cmd, **kw)
-            return r
+            return subprocess.run(cmd, **kw)
 
-        def ensure_label(name, color, description=''):
-            """Create label if it does not exist; silently pass if it does."""
-            r = gh(f'repos/{repo}/labels', body={
-                'name': name, 'color': color, 'description': description
-            }, method='POST')
-            # 422 = already exists, which is fine
+        def ensure_label(name):
+            color, desc = CATALOG[name]
+            r = gh(f'repos/{repo}/labels', body={'name': name, 'color': color,
+                                                   'description': desc}, method='POST')
             if r.returncode != 0 and '422' not in r.stderr:
                 print(f'Warning: could not create label "{name}": {r.stderr[:80]}')
 
-        # ------------------------------------------------------------------ #
-        # 1. PR size label
-        # ------------------------------------------------------------------ #
-        diff_stat = subprocess.run(
+        # Fetch current labels on the PR
+        r = gh(f'repos/{repo}/issues/{pr}/labels')
+        current = []
+        if r.returncode == 0:
+            try:
+                current = [l['name'] for l in json.loads(r.stdout)]
+            except Exception:
+                pass
+
+        # -------------------------------------------------------------- #
+        # 1. Size label (deterministic)
+        # -------------------------------------------------------------- #
+        stat = subprocess.run(
             ['git', 'diff', '--stat', f'origin/{base}...HEAD'],
             capture_output=True, text=True,
         ).stdout
-
-        summary = diff_stat.strip().split('\n')[-1] if diff_stat.strip() else ''
+        summary = stat.strip().split('\n')[-1] if stat.strip() else ''
         ins  = sum(int(x) for x in re.findall(r'(\d+) insertion', summary))
         dels = sum(int(x) for x in re.findall(r'(\d+) deletion', summary))
-        total_lines = ins + dels
+        total = ins + dels
 
-        SIZE_MAP = [
-            (0,    50,   'size: XS',  'b2dfdb', 'Extra-small PR (< 50 lines)'),
-            (50,   200,  'size: S',   '86d18e', 'Small PR (50-200 lines)'),
-            (200,  500,  'size: M',   'fbca04', 'Medium PR (200-500 lines)'),
-            (500,  1000, 'size: L',   'f99b2e', 'Large PR (500-1000 lines)'),
-            (1000, 9999, 'size: XL',  'e11d48', 'Very large PR (> 1000 lines)'),
-        ]
-        size_label = 'size: XL'
-        for lo, hi, name, color, desc in SIZE_MAP:
-            if lo <= total_lines < hi:
+        SIZE_THRESHOLDS = [(0, 50, 'size: xs'), (50, 200, 'size: s'),
+                           (200, 500, 'size: m'), (500, 1000, 'size: l')]
+        size_label = 'size: xl'
+        for lo, hi, name in SIZE_THRESHOLDS:
+            if lo <= total < hi:
                 size_label = name
-                size_color = color
-                size_desc  = desc
                 break
-        else:
-            size_color = 'e11d48'
-            size_desc  = 'Very large PR (> 1000 lines)'
 
-        # ------------------------------------------------------------------ #
-        # 2. Change type label from [TAG] in title or branch name
-        # ------------------------------------------------------------------ #
-        TAG_TO_LABEL = {
-            'ADD':   ('type: feature',  'a2eeef', 'New feature or capability'),
-            'IMP':   ('type: feature',  'a2eeef', 'Improvement to existing feature'),
-            'FIX':   ('type: fix',      'd73a4a', 'Bug fix'),
-            'UPD':   ('type: update',   '0075ca', 'Dependency or data update'),
-            'REF':   ('type: refactor', 'cfd3d7', 'Code refactor, no behavior change'),
-            'CLN':   ('type: refactor', 'cfd3d7', 'Cleanup / chore'),
-            'LINT':  ('type: chore',    'cfd3d7', 'Lint / formatting only'),
-            'PERF':  ('type: perf',     '00b4d8', 'Performance improvement'),
-            'REM':   ('type: chore',    'cfd3d7', 'Removal of code or files'),
-            'MOV':   ('type: chore',    'cfd3d7', 'File move / rename'),
-            'REL':   ('type: release',  '0e8a16', 'Release commit'),
-            'I18N':  ('type: i18n',     'bfd4f2', 'Internationalization'),
-            'CLA':   ('type: legal',    'e4e669', 'CLA or license'),
-            'MERGE': ('type: merge',    'cfd3d7', 'Merge commit'),
-            'REV':   ('type: revert',   'b60205', 'Revert a previous commit'),
+        # Remove stale size labels
+        for old in current:
+            if old.startswith('size: ') and old != size_label:
+                gh(f'repos/{repo}/issues/{pr}/labels/{old.replace(" ", "%20").replace(":", "%3A")}',
+                   method='DELETE')
+                print(f'Removed stale label: {old}')
+
+        # -------------------------------------------------------------- #
+        # 2. Type label (deterministic from [TAG] in title)
+        # -------------------------------------------------------------- #
+        TAG_TO_TYPE = {
+            'ADD': 'type: feature', 'IMP': 'type: feature',
+            'FIX': 'type: fix',
+            'REF': 'type: refactor', 'CLN': 'type: refactor',
+            'UPD': 'type: chore', 'REM': 'type: chore',
+            'MOV': 'type: chore', 'LINT': 'type: chore',
+            'CHORE': 'type: chore',
+            'PERF': 'type: perf',
+            'REL': 'type: release',
+            'REV': 'type: revert',
+            'I18N': 'type: i18n',
+            'DOCS': 'type: docs',
+            'TEST': 'type: test',
+            'SEC': 'type: security',
+            'CI': 'type: ci',
         }
+        type_label = None
+        m = re.match(r'^\[([A-Z0-9]+)\]', title)
+        if m:
+            type_label = TAG_TO_TYPE.get(m.group(1).upper())
 
-        tag_match = re.match(r'^\[([A-Z]+)\]', pr_title)
-        type_label_info = None
-        if tag_match:
-            tag = tag_match.group(1).upper()
-            type_label_info = TAG_TO_LABEL.get(tag)
+        # Collect deterministic labels to apply
+        to_apply = [size_label]
+        if type_label:
+            # Remove old type label if it changed
+            for old in current:
+                if old.startswith('type: ') and old != type_label:
+                    gh(f'repos/{repo}/issues/{pr}/labels/{old.replace(" ", "%20").replace(":", "%3A")}',
+                       method='DELETE')
+                    print(f'Removed stale label: {old}')
+            to_apply.append(type_label)
 
-        # ------------------------------------------------------------------ #
-        # 3. Area labels from changed files
-        # ------------------------------------------------------------------ #
-        changed_files = subprocess.run(
+        # Ensure labels exist and apply the ones not yet present
+        new_labels = [l for l in to_apply if l not in current]
+        for l in new_labels:
+            ensure_label(l)
+        if new_labels:
+            gh(f'repos/{repo}/issues/{pr}/labels', body={'labels': new_labels}, method='POST')
+            print(f'Applied deterministic labels: {new_labels}')
+        else:
+            print(f'Deterministic labels already present: {to_apply}')
+
+        # Save catalog and current state for Pass 2
+        state = {'current': current, 'size': size_label, 'type': type_label}
+        json.dump(state, open('/tmp/labels_state.json', 'w'))
+        # Save catalog for Pass 2
+        json.dump(CATALOG, open('/tmp/labels_catalog.json', 'w'))
+        PYEOF
+
+    - name: Collect PR context for AI
+      id: context
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess
+        from pathlib import Path
+
+        base  = os.environ['BASE_BRANCH']
+        title = os.environ.get('PR_TITLE', '')
+        body  = os.environ.get('PR_BODY', '')
+
+        # Changed files
+        files_result = subprocess.run(
             ['git', 'diff', '--name-only', f'origin/{base}...HEAD'],
             capture_output=True, text=True,
-        ).stdout.strip().splitlines()
+        )
+        changed_files = [f for f in files_result.stdout.strip().splitlines() if f]
 
-        area_labels = set()
-        for f in changed_files:
-            p = Path(f)
-            parts = p.parts
-            if not parts:
-                continue
-            # CI/CD
-            if '.github' in parts or 'Dockerfile' in p.name or 'docker-compose' in p.name:
-                area_labels.add(('area: ci/cd', 'e4e669', 'Changes to CI/CD pipeline'))
-            # Tests
-            if 'tests' in parts or p.name.startswith('test_') or p.stem.endswith('.test') or p.stem.endswith('.spec'):
-                area_labels.add(('area: tests', 'bfd4f2', 'Test additions or changes'))
-            # Docs
-            if p.suffix in ('.md', '.rst', '.mdx') or 'docs' in parts:
-                area_labels.add(('area: docs', '0075ca', 'Documentation changes'))
-            # Frontend
-            if p.suffix in ('.tsx', '.jsx', '.astro', '.css', '.scss'):
-                area_labels.add(('area: frontend', 'ff6b6b', 'Frontend / UI changes'))
-            # Backend / API
-            if any(kw in str(f).lower() for kw in ('api', 'routes', 'controllers', 'views', 'endpoints')):
-                area_labels.add(('area: api', 'ffd166', 'API / routes changes'))
-            # Security
-            if any(kw in str(f).lower() for kw in ('auth', 'security', 'permissions', 'access', 'token')):
-                area_labels.add(('area: security', 'b60205', 'Authentication / security changes'))
+        # Commits on branch
+        commits_result = subprocess.run(
+            ['git', 'log', f'origin/{base}...HEAD', '--format=%s'],
+            capture_output=True, text=True,
+        )
+        commits = [c for c in commits_result.stdout.strip().splitlines() if c]
+
+        # Diff summary (first 4 KB — just enough for context, not the whole diff)
+        diff_result = subprocess.run(
+            ['git', 'diff', '--stat', f'origin/{base}...HEAD'],
+            capture_output=True, text=True,
+        )
+        diff_stat = diff_result.stdout[:2000]
+
+        ctx = {
+            'title':         title,
+            'description':   body[:1500] if body else '(no description)',
+            'commits':       commits[:20],
+            'changed_files': changed_files[:80],
+            'diff_stat':     diff_stat,
+        }
+        json.dump(ctx, open('/tmp/labels_context.json', 'w'))
+        print(f"Context: {len(changed_files)} files, {len(commits)} commits")
+        PYEOF
+
+    - name: Pass 2 — AI area labels
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, re, subprocess, sys
+        from pathlib import Path
+
+        repo = os.environ['REPO']
+        pr   = os.environ['PR_NUMBER']
+
+        ctx     = json.load(open('/tmp/labels_context.json'))
+        state   = json.load(open('/tmp/labels_state.json'))
+        catalog = json.load(open('/tmp/labels_catalog.json'))
+
+        # Only the area labels are AI-assigned
+        area_labels = [k for k in catalog if k.startswith('area: ')]
+        current      = state.get('current', [])
+        current_area = [l for l in current if l.startswith('area: ')]
 
         # ------------------------------------------------------------------ #
-        # 4. Ensure labels exist and apply them
+        # Build prompt — give Claude ONLY the area labels to choose from.
+        # This is the anti-hallucination boundary: if it's not in the list,
+        # it cannot be assigned.
         # ------------------------------------------------------------------ #
-        labels_to_apply = []
+        area_list = '\n'.join(f'  - {l}: {catalog[l][1]}' for l in area_labels)
 
-        ensure_label(size_label, size_color, size_desc)
-        labels_to_apply.append(size_label)
+        prompt = f"""You are assigning area labels to a pull request. Your task is to pick
+the correct area labels from the EXACT list below — no others, no variations.
 
-        # Remove old size labels before applying new one
-        current_labels_r = gh(f'repos/{repo}/issues/{pr}/labels')
-        current_labels = []
-        if current_labels_r.returncode == 0:
-            try:
-                current_labels = [l['name'] for l in json.loads(current_labels_r.stdout)]
-            except Exception:
-                pass
-        for old in current_labels:
-            if old.startswith('size: ') and old != size_label:
-                gh(f'repos/{repo}/issues/{pr}/labels/{old.replace(" ", "%20")}', method='DELETE')
+## Pull request context
 
-        if type_label_info:
-            name, color, desc = type_label_info
-            ensure_label(name, color, desc)
-            labels_to_apply.append(name)
+Title: {ctx['title']}
 
-        for name, color, desc in area_labels:
-            ensure_label(name, color, desc)
-            labels_to_apply.append(name)
+Description:
+{ctx['description']}
 
-        # Deduplicate and skip labels already present
-        new_labels = [l for l in labels_to_apply if l not in current_labels]
-        if new_labels:
-            gh(f'repos/{repo}/issues/{pr}/labels',
-               body={'labels': new_labels}, method='POST')
-            print(f'Applied labels: {new_labels}')
+Commits:
+{chr(10).join('  - ' + c for c in ctx['commits'])}
+
+Changed files:
+{chr(10).join('  ' + f for f in ctx['changed_files'][:40])}
+
+Diff summary:
+{ctx['diff_stat']}
+
+## Available area labels (ONLY pick from this exact list)
+
+{area_list}
+
+## Already applied labels on this PR
+
+{', '.join(current) or 'none'}
+
+## Instructions
+
+1. Read the PR title, description, commits, and changed files carefully.
+2. Select 1–3 area labels that BEST describe what this PR touches.
+3. Only assign an area label if the PR clearly touches that area — do not guess.
+4. Do NOT assign an area label that is already present on the PR.
+5. Do NOT invent labels. Use ONLY the names from the list above, character-for-character.
+6. If none of the area labels apply, return an empty array.
+
+Output ONLY a valid JSON array of label name strings. No explanation, no markdown.
+Example: ["area: frontend", "area: api"]"""
+
+        # Call Claude
+        scripts_dir = os.environ['SCRIPTS_DIR']
+        r = subprocess.run(
+            ['python', f'{scripts_dir}/claude_api.py', prompt],
+            capture_output=True, text=True,
+            env={**os.environ, 'UNIFOX_PROFILE': 'default'},
+        )
+
+        if r.returncode != 0:
+            print(f'Warning: Claude API call failed — skipping AI labels.\n{r.stderr[:200]}')
+            sys.exit(0)
+
+        raw = r.stdout.strip()
+
+        # Strip markdown fences if present
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+
+        try:
+            suggested = json.loads(raw)
+            if not isinstance(suggested, list):
+                raise ValueError("Expected a JSON array")
+        except Exception as e:
+            print(f'Warning: Could not parse Claude response ({e}) — skipping AI labels.')
+            print(f'Raw: {raw[:300]}')
+            sys.exit(0)
+
+        # ------------------------------------------------------------------ #
+        # Strict validation: ONLY accept labels from the catalog.
+        # Any label Claude returns that is not in the catalog is silently
+        # discarded — this is the hard guard against hallucination.
+        # ------------------------------------------------------------------ #
+        valid_area_set = set(area_labels)
+        approved = [l for l in suggested if isinstance(l, str) and l.strip() in valid_area_set]
+        rejected = [l for l in suggested if l not in approved]
+
+        if rejected:
+            print(f'Discarded off-catalog suggestions from AI: {rejected}')
+
+        # Skip labels already on the PR
+        to_apply = [l for l in approved if l not in current]
+
+        if not to_apply:
+            print(f'No new area labels to apply (suggested: {approved}, current: {current_area})')
+            sys.exit(0)
+
+        # Ensure labels exist in the repo, then apply
+        def gh(endpoint, body=None, method='GET'):
+            cmd = ['gh', 'api']
+            if method != 'GET':
+                cmd += ['--method', method]
+            if body is not None:
+                cmd += ['--input', '-']
+            cmd.append(endpoint)
+            kw = {'capture_output': True, 'text': True}
+            if body is not None:
+                kw['input'] = json.dumps(body)
+            return subprocess.run(cmd, **kw)
+
+        for label in to_apply:
+            color, desc = catalog[label]
+            create_r = gh(f'repos/{repo}/labels',
+                          body={'name': label, 'color': color, 'description': desc},
+                          method='POST')
+            if create_r.returncode != 0 and '422' not in create_r.stderr:
+                print(f'Warning: could not create "{label}": {create_r.stderr[:80]}')
+
+        apply_r = gh(f'repos/{repo}/issues/{pr}/labels',
+                     body={'labels': to_apply}, method='POST')
+        if apply_r.returncode != 0:
+            print(f'Warning: could not apply labels: {apply_r.stderr[:120]}')
         else:
-            print(f'Labels already up to date: {labels_to_apply}')
-
-        if size_label in current_labels:
-            print(f'Size label unchanged: {size_label}')
+            print(f'Applied AI area labels: {to_apply}')
         PYEOF

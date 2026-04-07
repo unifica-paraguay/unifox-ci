@@ -67,7 +67,16 @@ runs:
           echo "Profile $PROFILE — skipping Odoo module detection."
         fi
 
-    - name: "[1] Branch naming"
+    - name: "[1] Commit messages"
+      id: commits
+      continue-on-error: true
+      shell: bash
+      env:
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        python "${{ github.action_path }}/../../scripts/check_commits.py" "$BASE_BRANCH"
+
+    - name: "[2] Branch naming"
       id: branch
       continue-on-error: true
       shell: bash
@@ -88,7 +97,7 @@ runs:
           echo "SKIP: Branch naming convention not enforced for profile '$PROFILE'"
         fi
 
-    - name: "[2] PR size check"
+    - name: "[3] PR size check"
       id: pr-size
       continue-on-error: true
       shell: bash
@@ -133,7 +142,7 @@ runs:
             print(f"Size OK.")
         PYEOF
 
-    - name: "[3] Version bump (Odoo)"
+    - name: "[4] Version bump (Odoo)"
       id: version
       continue-on-error: true
       if: steps.detect.outputs.modules != ''
@@ -144,7 +153,7 @@ runs:
         python "${{ github.action_path }}/../../scripts/check_version_bump.py" \
           "$BASE_BRANCH" ${{ steps.detect.outputs.modules }}
 
-    - name: "[4] Manifest & structure (Odoo)"
+    - name: "[5] Manifest & structure (Odoo)"
       id: manifest
       continue-on-error: true
       if: steps.detect.outputs.modules != ''
@@ -153,7 +162,7 @@ runs:
         python "${{ github.action_path }}/../../scripts/check_manifest.py" \
           ${{ steps.detect.outputs.modules }}
 
-    - name: "[5] Tests exist (Odoo)"
+    - name: "[6] Tests exist (Odoo)"
       id: tests-odoo
       continue-on-error: true
       if: steps.detect.outputs.modules != ''
@@ -162,7 +171,7 @@ runs:
         python "${{ github.action_path }}/../../scripts/check_tests.py" \
           ${{ steps.detect.outputs.modules }}
 
-    - name: "[6] Lint — Python (flake8)"
+    - name: "[7] Lint — Python (flake8)"
       id: lint-py
       continue-on-error: true
       shell: bash
@@ -391,6 +400,7 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        COMMITS_OUTCOME: ${{ steps.commits.outcome }}
         BRANCH_OUTCOME: ${{ steps.branch.outcome }}
         PR_SIZE_OUTCOME: ${{ steps.pr-size.outcome }}
         VERSION_OUTCOME: ${{ steps.version.outcome }}
@@ -425,6 +435,7 @@ runs:
         ts       = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
         outcomes = {
+            'commits':      os.environ['COMMITS_OUTCOME'],
             'branch':       os.environ['BRANCH_OUTCOME'],
             'pr_size':      os.environ['PR_SIZE_OUTCOME'],
             'version':      os.environ['VERSION_OUTCOME'],
@@ -442,6 +453,7 @@ runs:
         overall = '\u274c Some checks failed' if has_failure else '\u2705 All checks passed'
 
         rows = [
+            ('Commit messages', outcomes['commits']),
             ('Branch naming', outcomes['branch']),
             ('PR size', outcomes['pr_size']),
         ]
@@ -526,6 +538,7 @@ runs:
       if: always()
       shell: bash
       env:
+        COMMITS_OUTCOME:     ${{ steps.commits.outcome }}
         BRANCH_OUTCOME:      ${{ steps.branch.outcome }}
         PR_SIZE_OUTCOME:     ${{ steps.pr-size.outcome }}
         VERSION_OUTCOME:     ${{ steps.version.outcome }}
@@ -539,6 +552,7 @@ runs:
         TESTS_PYTEST_OUTCOME: ${{ steps.tests-pytest.outcome }}
       run: |
         failed=false
+        [ "$COMMITS_OUTCOME"     = "failure" ] && failed=true
         [ "$BRANCH_OUTCOME"      = "failure" ] && failed=true
         [ "$PR_SIZE_OUTCOME"     = "failure" ] && failed=true
         [ "$VERSION_OUTCOME"     = "failure" ] && failed=true
