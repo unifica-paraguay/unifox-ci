@@ -996,15 +996,20 @@ runs:
         def prev_table(items):
             rows = ['| File | Issue |', '|------|-------|']
             for c in items:
-                path = c.get('path', '')
-                line = c.get('line', '')
-                body = c.get('body', '')
+                path    = c.get('path', '')
+                line    = c.get('line', '')
+                body    = c.get('body', '')
+                cid     = c.get('id', '')
                 first_line = body.split('\n')[0]
                 # Strip bold word label but keep leading emoji (e.g. "🔴 **Critical:** " → "🔴 ")
                 first_line = _SEVER_WORD_RE.sub('', first_line, count=1).strip()
                 # Truncate at word boundary
                 if len(first_line) > 100:
                     first_line = first_line[:100].rsplit(' ', 1)[0].rstrip('.,;') + '…'
+                # Append link to original comment
+                if cid:
+                    link = f'[↗](https://github.com/{repo}/pull/{pr}#discussion_r{cid})'
+                    first_line = f'{first_line} {link}'
                 loc   = f'`{path}:{line}`' if path and line else (f'`{path}`' if path else '—')
                 rows.append(f'| {loc} | {first_line} |')
             return '\n'.join(rows)
