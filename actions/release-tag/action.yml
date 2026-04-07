@@ -249,9 +249,14 @@ runs:
       shell: bash
       run: |
         python3 - <<'PYEOF'
-        import json
+        import json, sys
 
-        data = json.load(open('/tmp/release_parsed.json'))
+        try:
+            with open('/tmp/release_parsed.json') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — version bump step likely failed.")
+            sys.exit(1)
         tag  = data['new_tag']
 
         lines = [f"# Release {tag}", '', data.get('release_summary', ''), '']
@@ -277,9 +282,14 @@ runs:
       shell: bash
       run: |
         python3 - <<'PYEOF'
-        import json
+        import json, sys
 
-        data = json.load(open('/tmp/release_parsed.json'))
+        try:
+            with open('/tmp/release_parsed.json') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — version bump step likely failed.")
+            sys.exit(1)
 
         print("=" * 60)
         print("DRY RUN — no tags or releases will be created")
@@ -304,9 +314,14 @@ runs:
         REPO: ${{ github.repository }}
       run: |
         python3 - <<'PYEOF'
-        import json, os, subprocess
+        import json, os, subprocess, sys
 
-        data       = json.load(open('/tmp/release_parsed.json'))
+        try:
+            with open('/tmp/release_parsed.json') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — version bump step likely failed.")
+            sys.exit(1)
         new_tag    = data['new_tag']
         float_tag  = data['floating_tag']
         latest_tag = data['latest_tag']
@@ -350,9 +365,14 @@ runs:
         BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
         python3 - <<'PYEOF'
-        import json, os, subprocess
+        import json, os, subprocess, sys
 
-        data       = json.load(open('/tmp/release_parsed.json'))
+        try:
+            with open('/tmp/release_parsed.json') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — version bump step likely failed.")
+            sys.exit(1)
         new_tag    = data['new_tag']
         repo       = os.environ['REPO']
         tag_prefix = os.environ['TAG_PREFIX']
@@ -402,8 +422,9 @@ runs:
         import json, os
 
         try:
-            data = json.load(open('/tmp/release_parsed.json'))
-        except Exception:
+            with open('/tmp/release_parsed.json') as f:
+                data = json.load(f)
+        except FileNotFoundError:
             print("No release data available.")
             raise SystemExit(0)
 
