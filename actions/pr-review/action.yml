@@ -893,10 +893,26 @@ runs:
         status_str = ' \u00b7 '.join(parts) if parts else 'no issues'
 
         verdict = data.get('verdict', 'COMMENT')
+
+        # Override: cannot approve when static checks (commit messages, lint,
+        # PR size, etc.) are failing. The code may be fine but the PR is not
+        # ready to merge until the pipeline is green.
+        static_checks_failed = os.environ.get('STATIC_CHECKS_FAILED', 'false').lower() == 'true'
+        override_note = ''
+        if static_checks_failed and verdict == 'APPROVED':
+            verdict = 'CHANGES_REQUESTED'
+            override_note = (
+                '\n\n---\n'
+                '> **Pipeline checks are failing.** The code looks good, but the PR cannot '
+                'be approved while static checks (commit messages, lint, PR size, …) are red. '
+                'Fix those first, then re-push.'
+            )
+            print('Static checks failed — overriding APPROVED → CHANGES_REQUESTED')
+
         verdict_icon = {
-            'APPROVED': '\u2705',
+            'APPROVED':          '\u2705',
             'CHANGES_REQUESTED': '\u274c',
-            'COMMENT': '\U0001f4ac',
+            'COMMENT':           '\U0001f4ac',
         }.get(verdict, '\U0001f4ac')
 
         rev_body_parts = [
@@ -909,23 +925,7 @@ runs:
             f'**Issues:** {status_str}',
         ]
 
-        rev_body = '\n'.join(rev_body_parts)
-
-        # Override: cannot approve when static checks (commit messages, lint,
-        # PR size, etc.) are failing. The code may be fine but the PR is not
-        # ready to merge until the pipeline is green.
-        static_checks_failed = os.environ.get('STATIC_CHECKS_FAILED', 'false').lower() == 'true'
-        verdict = data.get('verdict', 'COMMENT')
-        if static_checks_failed and verdict == 'APPROVED':
-            verdict = 'CHANGES_REQUESTED'
-            rev_body = rev_body + (
-                '\n\n---\n'
-                '> **Pipeline checks are failing.** Verdict overridden from APPROVED to '
-                'CHANGES_REQUESTED — the code review looks good, but the PR cannot be '
-                'approved while static checks (commit messages, lint, PR size, …) are red. '
-                'Fix those first, then re-push.'
-            )
-            print('Static checks failed — overriding APPROVED → CHANGES_REQUESTED')
+        rev_body = '\n'.join(rev_body_parts) + override_note
 
         event_map = {
             'APPROVED':          'APPROVE',
