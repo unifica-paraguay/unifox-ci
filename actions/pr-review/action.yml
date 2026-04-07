@@ -26,6 +26,10 @@ inputs:
     description: "Repository profile (odoo, react, astro, python, node, default, auto)"
     required: false
     default: "auto"
+  static_checks_failed:
+    description: "Whether the static-checks job failed (true/false). Prevents approval when pipeline checks are broken."
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
@@ -765,6 +769,7 @@ runs:
         SHA: ${{ github.event.pull_request.head.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
+        STATIC_CHECKS_FAILED: ${{ inputs.static_checks_failed }}
       run: |
         python3 - <<'PYEOF'
         import json, os, subprocess, sys
@@ -906,12 +911,28 @@ runs:
 
         rev_body = '\n'.join(rev_body_parts)
 
+        # Override: cannot approve when static checks (commit messages, lint,
+        # PR size, etc.) are failing. The code may be fine but the PR is not
+        # ready to merge until the pipeline is green.
+        static_checks_failed = os.environ.get('STATIC_CHECKS_FAILED', 'false').lower() == 'true'
+        verdict = data.get('verdict', 'COMMENT')
+        if static_checks_failed and verdict == 'APPROVED':
+            verdict = 'CHANGES_REQUESTED'
+            rev_body = rev_body + (
+                '\n\n---\n'
+                '> **Pipeline checks are failing.** Verdict overridden from APPROVED to '
+                'CHANGES_REQUESTED — the code review looks good, but the PR cannot be '
+                'approved while static checks (commit messages, lint, PR size, …) are red. '
+                'Fix those first, then re-push.'
+            )
+            print('Static checks failed — overriding APPROVED → CHANGES_REQUESTED')
+
         event_map = {
             'APPROVED':          'APPROVE',
             'CHANGES_REQUESTED': 'REQUEST_CHANGES',
             'COMMENT':           'COMMENT',
         }
-        event = event_map.get(data.get('verdict', 'COMMENT'), 'COMMENT')
+        event = event_map.get(verdict, 'COMMENT')
 
         SEV_PREFIX = {
             'critical':   '\U0001f534 **Critical**',
