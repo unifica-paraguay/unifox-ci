@@ -1,0 +1,55 @@
+name: "[Reusable] PR AI Enrichment"
+
+# Centralised PR enrichment + code review for any repo in the org.
+# Call this from your repo's pr-pipeline.yml with:
+#
+#   jobs:
+#     ai-enrich:
+#       uses: unifica-paraguay/unifox-ci/.github/workflows/reusable-pr-ai-enrich.yml@v1
+#       with:
+#         profile: odoo   # or 'default'
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "unifox-ci review profile (e.g. 'odoo', 'default')"
+        type: string
+        default: "default"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  enrich-metadata:
+    name: Update title & description
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          event_action: ${{ github.event.action }}
+          profile: ${{ inputs.profile }}
+
+  ai-code-review:
+    name: AI code review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/pr-review@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          profile: ${{ inputs.profile }}

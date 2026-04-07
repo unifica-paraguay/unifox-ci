@@ -11,32 +11,8 @@ permissions:
 
 jobs:
   ai-enrich:
-    name: AI Enrichment
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./actions/pr-enrich
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
-          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
-          base_branch: ${{ github.base_ref }}
-          event_action: ${{ github.event.action }}
-          profile: default
-
-  code-review:
-    name: AI Code Review
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: ./actions/pr-review
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
-          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
-          base_branch: ${{ github.base_ref }}
-          profile: default
+    name: AI Enrichment & Review
+    uses: ./.github/workflows/reusable-pr-ai-enrich.yml
+    with:
+      profile: default
+    secrets: inherit
