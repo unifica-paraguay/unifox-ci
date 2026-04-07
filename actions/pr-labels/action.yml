@@ -175,7 +175,8 @@ runs:
         # Remove stale size labels
         for old in current:
             if old.startswith('size: ') and old != size_label:
-                gh(f'repos/{repo}/issues/{pr}/labels/{quote(old, safe='')}',
+                encoded = quote(old, safe='')
+                gh(f'repos/{repo}/issues/{pr}/labels/{encoded}',
                    method='DELETE')
                 print(f'Removed stale label: {old}')
 
@@ -209,7 +210,8 @@ runs:
             # Remove old type label if it changed
             for old in current:
                 if old.startswith('type: ') and old != type_label:
-                    gh(f'repos/{repo}/issues/{pr}/labels/{quote(old, safe='')}',
+                    encoded = quote(old, safe='')
+                    gh(f'repos/{repo}/issues/{pr}/labels/{encoded}',
                        method='DELETE')
                     print(f'Removed stale label: {old}')
             to_apply.append(type_label)
