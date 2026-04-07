@@ -538,30 +538,61 @@ runs:
       if: always()
       shell: bash
       env:
-        COMMITS_OUTCOME:     ${{ steps.commits.outcome }}
-        BRANCH_OUTCOME:      ${{ steps.branch.outcome }}
-        PR_SIZE_OUTCOME:     ${{ steps.pr-size.outcome }}
-        VERSION_OUTCOME:     ${{ steps.version.outcome }}
-        MANIFEST_OUTCOME:    ${{ steps.manifest.outcome }}
-        TESTS_ODOO_OUTCOME:  ${{ steps.tests-odoo.outcome }}
-        LINT_PY_OUTCOME:     ${{ steps.lint-py.outcome }}
-        LINT_ESLINT_OUTCOME: ${{ steps.lint-eslint.outcome }}
-        TYPECHECK_OUTCOME:   ${{ steps.typecheck.outcome }}
-        ASTRO_CHECK_OUTCOME: ${{ steps.astro-check.outcome }}
-        TESTS_NODE_OUTCOME:  ${{ steps.tests-node.outcome }}
+        COMMITS_OUTCOME:      ${{ steps.commits.outcome }}
+        BRANCH_OUTCOME:       ${{ steps.branch.outcome }}
+        PR_SIZE_OUTCOME:      ${{ steps.pr-size.outcome }}
+        VERSION_OUTCOME:      ${{ steps.version.outcome }}
+        MANIFEST_OUTCOME:     ${{ steps.manifest.outcome }}
+        TESTS_ODOO_OUTCOME:   ${{ steps.tests-odoo.outcome }}
+        LINT_PY_OUTCOME:      ${{ steps.lint-py.outcome }}
+        LINT_ESLINT_OUTCOME:  ${{ steps.lint-eslint.outcome }}
+        TYPECHECK_OUTCOME:    ${{ steps.typecheck.outcome }}
+        ASTRO_CHECK_OUTCOME:  ${{ steps.astro-check.outcome }}
+        TESTS_NODE_OUTCOME:   ${{ steps.tests-node.outcome }}
         TESTS_PYTEST_OUTCOME: ${{ steps.tests-pytest.outcome }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
-        failed=false
-        [ "$COMMITS_OUTCOME"     = "failure" ] && failed=true
-        [ "$BRANCH_OUTCOME"      = "failure" ] && failed=true
-        [ "$PR_SIZE_OUTCOME"     = "failure" ] && failed=true
-        [ "$VERSION_OUTCOME"     = "failure" ] && failed=true
-        [ "$MANIFEST_OUTCOME"    = "failure" ] && failed=true
-        [ "$TESTS_ODOO_OUTCOME"  = "failure" ] && failed=true
-        [ "$LINT_PY_OUTCOME"     = "failure" ] && failed=true
-        [ "$LINT_ESLINT_OUTCOME" = "failure" ] && failed=true
-        [ "$TYPECHECK_OUTCOME"   = "failure" ] && failed=true
-        [ "$ASTRO_CHECK_OUTCOME" = "failure" ] && failed=true
-        [ "$TESTS_NODE_OUTCOME"  = "failure" ] && failed=true
-        [ "$TESTS_PYTEST_OUTCOME" = "failure" ] && failed=true
-        $failed && exit 1 || exit 0
+        # Map each check to a human-readable label
+        declare -A LABELS=(
+          [COMMITS_OUTCOME]="Commit messages"
+          [BRANCH_OUTCOME]="Branch naming"
+          [PR_SIZE_OUTCOME]="PR size"
+          [VERSION_OUTCOME]="Version bump (Odoo)"
+          [MANIFEST_OUTCOME]="Manifest & structure (Odoo)"
+          [TESTS_ODOO_OUTCOME]="Tests exist (Odoo)"
+          [LINT_PY_OUTCOME]="Lint — Python (flake8)"
+          [LINT_ESLINT_OUTCOME]="Lint — ESLint"
+          [TYPECHECK_OUTCOME]="Type check (tsc)"
+          [ASTRO_CHECK_OUTCOME]="Astro check"
+          [TESTS_NODE_OUTCOME]="Tests (Node)"
+          [TESTS_PYTEST_OUTCOME]="Tests (pytest)"
+        )
+
+        failed_labels=()
+        for key in "${!LABELS[@]}"; do
+          val="${!key}"
+          if [ "$val" = "failure" ]; then
+            failed_labels+=("${LABELS[$key]}")
+            # Emit a GitHub Actions error annotation — visible in PR checks without opening logs
+            echo "::error title=Static check failed — ${LABELS[$key]}::${LABELS[$key]} check failed. Fix the issues listed in the PR comment, then push again."
+          fi
+        done
+
+        if [ ${#failed_labels[@]} -gt 0 ]; then
+          # Write a job summary so the Actions "Summary" tab shows the failures at a glance
+          {
+            echo "## ❌ Static checks failed"
+            echo ""
+            echo "The following checks did not pass:"
+            echo ""
+            for label in "${failed_labels[@]}"; do
+              echo "- ❌ **${label}**"
+            done
+            echo ""
+            echo "See the PR comment for details on each failure, or [view the full log](${RUN_URL})."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        else
+          echo "## ✅ All static checks passed" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
