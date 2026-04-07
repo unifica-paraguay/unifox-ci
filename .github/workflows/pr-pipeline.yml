@@ -20,4 +20,5 @@ jobs:
     uses: ./.github/workflows/reusable-pr-ai-enrich.yml
     with:
       profile: default
+      enable_release_preview: true
     secrets: inherit

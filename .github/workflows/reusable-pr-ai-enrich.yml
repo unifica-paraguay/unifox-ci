@@ -44,6 +44,14 @@ on:
         description: "Run Odoo tests: Layer 1 (modified modules) + Layer 2 (native deps)"
         type: boolean
         default: false
+      enable_release_preview:
+        description: "Post a release proposal comment on the PR (minimize outdated ones)"
+        type: boolean
+        default: false
+      release_tag_prefix:
+        description: "Tag style for release preview: semver | odoo"
+        type: string
+        default: "semver"
 
 jobs:
   # -------------------------------------------------------------------------
@@ -252,3 +260,24 @@ jobs:
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           base_branch: ${{ github.base_ref }}
+
+  release-preview:
+    name: Release preview
+    needs: pre-flight
+    if: ${{ inputs.enable_release_preview }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/release-proposal@claude/improve-bot-testing-q5hXf
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          pr_number: ${{ github.event.pull_request.number }}
+          tag_prefix: ${{ inputs.release_tag_prefix }}
