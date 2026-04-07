@@ -1,0 +1,342 @@
+name: "unifox-ci: Release Proposal"
+description: >
+  Analyzes commits since the last release tag, asks Claude for the correct
+  semver bump, then opens or updates a GitHub issue with the proposed version,
+  changelog, and /release slash commands.
+
+inputs:
+  anthropic_api_key:
+    description: "Anthropic API key"
+    required: true
+  unifox_app_id:
+    description: "unifox-ci GitHub App ID"
+    required: true
+  unifox_private_key:
+    description: "unifox-ci GitHub App private key"
+    required: true
+  tag_prefix:
+    description: "Tag style: 'semver' (v1.2.3) or 'odoo' (19.0-v1.2.3 branch-scoped)"
+    required: false
+    default: "semver"
+  odoo_version:
+    description: "Odoo major branch (e.g. '19.0'). Only used when tag_prefix=odoo."
+    required: false
+    default: "19.0"
+  base_branch:
+    description: "Branch being released"
+    required: false
+    default: "main"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate app token
+      id: gen-token
+      continue-on-error: true
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.unifox_app_id }}
+        private-key: ${{ inputs.unifox_private_key }}
+
+    - name: Resolve token
+      id: token
+      shell: bash
+      env:
+        APP_TOKEN: ${{ steps.gen-token.outputs.token }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      run: echo "value=${APP_TOKEN:-$FALLBACK_TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install requests
+
+    - name: Detect last release tag
+      id: last-tag
+      shell: bash
+      env:
+        TAG_PREFIX: ${{ inputs.tag_prefix }}
+        ODOO_VERSION: ${{ inputs.odoo_version }}
+      run: |
+        if [ "$TAG_PREFIX" = "odoo" ]; then
+          PATTERN="${ODOO_VERSION}-v[0-9]*.[0-9]*.[0-9]*"
+        else
+          PATTERN="v[0-9]*.[0-9]*.[0-9]*"
+        fi
+        LAST=$(git tag --list "$PATTERN" --sort=-version:refname | head -1)
+        if [ -z "$LAST" ]; then
+          echo "No previous release tag found — this is the first release."
+          echo "last_tag=" >> "$GITHUB_OUTPUT"
+          echo "is_first=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Last release tag: $LAST"
+          echo "last_tag=${LAST}" >> "$GITHUB_OUTPUT"
+          echo "is_first=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Collect commits since last release
+      shell: bash
+      env:
+        LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+        IS_FIRST: ${{ steps.last-tag.outputs.is_first }}
+      run: |
+        if [ "$IS_FIRST" = "true" ]; then
+          git log HEAD --pretty=format:"%H|%s|%an|%ad" --date=short \
+            > /tmp/release_commits.txt
+        else
+          git log "${LAST_TAG}..HEAD" --pretty=format:"%H|%s|%an|%ad" --date=short \
+            > /tmp/release_commits.txt
+        fi
+        echo "Commits to analyze: $(wc -l < /tmp/release_commits.txt)"
+
+    - name: Collect Odoo module versions
+      if: inputs.tag_prefix == 'odoo'
+      shell: bash
+      run: |
+        python3 - <<'PYEOF'
+        import re, json
+        from pathlib import Path
+        versions = {}
+        for manifest in sorted(Path('.').glob('unifica_*/__manifest__.py')):
+            module = manifest.parent.name
+            content = manifest.read_text()
+            m = re.search(r"['\"]version['\"]\s*:\s*['\"]([^'\"]+)['\"]", content)
+            if m:
+                versions[module] = m.group(1)
+        json.dump(versions, open('/tmp/module_versions.json', 'w'), indent=2)
+        print(json.dumps(versions, indent=2))
+        PYEOF
+
+    - name: Ask Claude for version bump
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        TAG_PREFIX: ${{ inputs.tag_prefix }}
+        ODOO_VERSION: ${{ inputs.odoo_version }}
+        LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+        IS_FIRST: ${{ steps.last-tag.outputs.is_first }}
+        SCRIPTS_DIR: ${{ github.action_path }}/../../scripts
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess
+
+        tag_prefix  = os.environ['TAG_PREFIX']
+        odoo_ver    = os.environ['ODOO_VERSION']
+        last_tag    = os.environ['LAST_TAG']
+        is_first    = os.environ['IS_FIRST'] == 'true'
+        scripts_dir = os.environ['SCRIPTS_DIR']
+
+        commits_raw = open('/tmp/release_commits.txt').read().strip() or '(no commits found)'
+        current_version = 'none — first release' if is_first else last_tag
+
+        if tag_prefix == 'odoo':
+            try:
+                mod_versions = json.load(open('/tmp/module_versions.json'))
+                mod_ver_text = json.dumps(mod_versions, indent=2)
+            except FileNotFoundError:
+                mod_ver_text = '(none found)'
+            branch_context = (
+                f"Branch: {odoo_ver} — this version prefix scopes all tags for this Odoo major release.\n"
+                f"Current Odoo module versions:\n{mod_ver_text}\n"
+            )
+            new_tag_example   = f"{odoo_ver}-v1.2.3"
+            float_tag_example = f"{odoo_ver}-v1"
+            latest_example    = f"{odoo_ver}-latest"
+        else:
+            branch_context    = ""
+            new_tag_example   = "v1.2.3"
+            float_tag_example = "v1"
+            latest_example    = "latest"
+
+        prompt = f"""You are a versioning assistant for a software system. Analyze these \
+commits and determine the correct semantic version bump for the SYSTEM as a whole \
+(not individual modules).
+
+Tag style: {tag_prefix}
+Current system version: {current_version}
+{branch_context}
+Commits since last system release (format: SHA|subject|author|date):
+{commits_raw}
+
+Bump rules:
+- patch (Z): bug fixes, docs, CI changes, minor improvements
+- minor (Y): new features, new modules, significant improvements
+- major (X): breaking changes, major architectural changes, dropping support for something
+
+For odoo style, only bump the semver segment (X.Y.Z) of {odoo_ver}-vX.Y.Z.
+The branch prefix ({odoo_ver}) never changes — it identifies the Odoo major release line.
+If this is the first release, start from v0.1.0 for minor features or v1.0.0 for a stable release.
+
+Output ONLY a valid JSON object:
+{{
+  "new_tag": "{new_tag_example}",
+  "bump_type": "patch|minor|major",
+  "floating_tag": "{float_tag_example}",
+  "latest_tag": "{latest_example}",
+  "reasoning": "one line explanation",
+  "changelog_sections": {{
+    "New features": [],
+    "Improvements": [],
+    "Bug fixes": [],
+    "Infrastructure/CI": [],
+    "Other": []
+  }},
+  "release_summary": "2-3 sentence summary of this system release"
+}}
+Omit empty arrays from changelog_sections.
+No markdown fences, no explanation outside the JSON."""
+
+        result = subprocess.run(
+            ['python3', f'{scripts_dir}/claude_api.py', prompt],
+            capture_output=True, text=True,
+        )
+        raw = result.stdout.strip()
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Parse error: {e}\nRaw: {raw[:500]}")
+            raise SystemExit(1)
+
+        json.dump(data, open('/tmp/release_parsed.json', 'w'), indent=2)
+        print(f"Proposed tag: {data['new_tag']}  ({data['bump_type']})")
+        print(f"Reasoning:    {data['reasoning']}")
+        PYEOF
+
+    - name: Create or update release proposal issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.token.outputs.value }}
+        REPO: ${{ github.repository }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        ACTOR: ${{ github.actor }}
+        TAG_PREFIX: ${{ inputs.tag_prefix }}
+        ODOO_VERSION: ${{ inputs.odoo_version }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
+        LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os, subprocess
+
+        data        = json.load(open('/tmp/release_parsed.json'))
+        repo        = os.environ['REPO']
+        run_url     = os.environ['RUN_URL']
+        actor       = os.environ['ACTOR']
+        tag_prefix  = os.environ['TAG_PREFIX']
+        odoo_ver    = os.environ['ODOO_VERSION']
+        base_branch = os.environ['BASE_BRANCH']
+        last_tag    = os.environ.get('LAST_TAG') or '(none — first release)'
+        gh_token    = os.environ['GH_TOKEN']
+
+        new_tag   = data['new_tag']
+        bump_type = data['bump_type']
+        reasoning = data['reasoning']
+        env       = {**os.environ, 'GH_TOKEN': gh_token}
+
+        # Build changelog markdown
+        changelog_lines = []
+        for section in ['New features', 'Improvements', 'Bug fixes', 'Infrastructure/CI', 'Other']:
+            items = data.get('changelog_sections', {}).get(section, [])
+            if not items:
+                continue
+            changelog_lines += [f'### {section}', '']
+            changelog_lines += [f'- {item}' for item in items]
+            changelog_lines.append('')
+        changelog_md = '\n'.join(changelog_lines).strip() or '_No changes recorded._'
+
+        # Build module versions table (odoo only)
+        module_table = ''
+        if tag_prefix == 'odoo':
+            try:
+                mods = json.load(open('/tmp/module_versions.json'))
+                if mods:
+                    rows = '\n'.join(f'| `{m}` | `{v}` |' for m, v in sorted(mods.items()))
+                    module_table = (
+                        '\n---\n\n## Module versions at this release\n\n'
+                        '| Module | Version |\n|--------|----------|\n'
+                        f'{rows}\n'
+                    )
+            except FileNotFoundError:
+                pass
+
+        # Ensure label exists
+        lresult = subprocess.run(
+            ['gh', 'label', 'list', '--repo', repo, '--json', 'name'],
+            capture_output=True, text=True, env=env,
+        )
+        existing_labels = [l['name'] for l in json.loads(lresult.stdout or '[]')]
+        if 'release-proposal' not in existing_labels:
+            subprocess.run([
+                'gh', 'label', 'create', 'release-proposal',
+                '--repo', repo, '--color', '0075ca',
+                '--description', 'Automated release proposal from unifox-ci',
+            ], env=env, check=True)
+            print('Created label: release-proposal')
+
+        # Build issue body
+        cmds = (
+            f'| `/release confirm` | Create tag `{new_tag}` and publish GitHub Release |\n'
+            f'| `/release cancel` | Close this proposal without releasing |\n'
+            f'| `/release re-analyze` | Re-run analysis (useful after additional merges) |'
+        )
+        body = (
+            f'<!-- release-proposal -->\n'
+            f'<!-- branch: {base_branch} -->\n'
+            f'<!-- proposed-tag: {new_tag} -->\n\n'
+            f'## \U0001f98a unifox-ci \u2014 Release Proposal\n\n'
+            f'**Branch:** `{base_branch}`\n'
+            f'**Current version:** `{last_tag}`\n'
+            f'**Proposed version:** `{new_tag}`\n'
+            f'**Bump type:** {bump_type}\n\n'
+            f'> {reasoning}\n\n'
+            f'---\n\n'
+            f'## Changelog\n\n'
+            f'{changelog_md}\n'
+            f'{module_table}\n'
+            f'---\n\n'
+            f'## Commands\n\n'
+            f'Reply with one of the following commands to proceed:\n\n'
+            f'| Command | Action |\n'
+            f'|---------|--------|\n'
+            f'{cmds}\n\n'
+            f'> \u26a0\ufe0f Only maintainers with write access can execute these commands.\n\n'
+            f'---\n'
+            f'*Proposed by unifox-ci after merge to `{base_branch}` \u2014 [View run]({run_url})*'
+        )
+        title = f'[RELEASE PROPOSAL] {new_tag} \u2014 pending confirmation'
+
+        # Find existing open issue for this branch
+        issues = json.loads(subprocess.run(
+            ['gh', 'issue', 'list', '--repo', repo, '--label', 'release-proposal',
+             '--state', 'open', '--json', 'number,body'],
+            capture_output=True, text=True, env=env,
+        ).stdout or '[]')
+        existing = next(
+            (i for i in issues if f'<!-- branch: {base_branch} -->' in i.get('body', '')),
+            None,
+        )
+
+        if existing:
+            subprocess.run([
+                'gh', 'issue', 'edit', str(existing['number']),
+                '--repo', repo, '--title', title, '--body', body,
+            ], check=True, env=env)
+            print(f"Updated existing proposal issue #{existing['number']}")
+        else:
+            # Try with assignee, fall back without if it fails
+            base_args = [
+                'gh', 'issue', 'create', '--repo', repo,
+                '--title', title, '--body', body, '--label', 'release-proposal',
+            ]
+            try:
+                r = subprocess.run(base_args + ['--assignee', actor],
+                                   capture_output=True, text=True, check=True, env=env)
+            except subprocess.CalledProcessError:
+                r = subprocess.run(base_args, capture_output=True, text=True, check=True, env=env)
+            print(f"Created new proposal issue: {r.stdout.strip()}")
+        PYEOF
