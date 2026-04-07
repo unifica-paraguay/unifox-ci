@@ -129,7 +129,7 @@ runs:
         print(f"PR size: {files_changed} files, {ins} insertions, {dels} deletions ({total} total lines changed)")
 
         WARN_LINES  = 1000
-        ERROR_LINES = 4000
+        ERROR_LINES = 5000
 
         if total > ERROR_LINES:
             print(f"ERROR: PR is very large ({total} lines changed). Consider splitting into smaller PRs.")

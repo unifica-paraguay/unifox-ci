@@ -102,6 +102,8 @@ def get_commits(base_branch: str) -> list[tuple[str, str]]:
             "Skipping commit message check.",
             file=sys.stderr,
         )
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
         return []
 
     commits = []

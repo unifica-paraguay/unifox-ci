@@ -177,3 +177,13 @@ def test_imperative_no_mood_warning():
     _, warnings = validate_subject("[IMP] auth: add retry logic")
     mood_warnings = [w for w in warnings if "tense" in w or "gerund" in w]
     assert not mood_warnings, "Imperative verb should not trigger mood warning"
+
+
+# ---------------------------------------------------------------------------
+# Scope edge-cases
+# ---------------------------------------------------------------------------
+
+def test_whitespace_only_scope_is_error():
+    errors, _ = validate_subject("[FIX]   : description here")
+    assert errors, "Whitespace-only scope should produce an error"
+    assert any("scope" in e.lower() for e in errors)

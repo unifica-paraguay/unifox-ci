@@ -120,7 +120,7 @@ jobs:
           fetch-depth: 0
 
       - id: proposal
-        uses: unifica-paraguay/unifox-ci/actions/release-proposal@v1
+        uses: unifica-paraguay/unifox-ci/actions/release-proposal@claude/improve-bot-testing-q5hXf
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id:     ${{ secrets.UNIFOX_CI_APP_ID }}
@@ -176,7 +176,7 @@ jobs:
           token: ${{ steps.bot-token.outputs.token }}
 
       - id: tag
-        uses: unifica-paraguay/unifox-ci/actions/release-tag@v1
+        uses: unifica-paraguay/unifox-ci/actions/release-tag@claude/improve-bot-testing-q5hXf
         with:
           anthropic_api_key:  ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id:      ${{ secrets.UNIFOX_CI_APP_ID }}
