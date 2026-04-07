@@ -282,8 +282,10 @@ runs:
                 f"Already resolved: {len(resolved)}",
                 "",
                 "FOLLOW-UP RULES \u2014 strictly enforced:",
-                "- Pending issue NOW FIXED in the diff below \u2192 put in reply_to with resolved=true",
-                "- Pending issue STILL PRESENT and unchanged \u2192 put in reply_to with resolved=false; do NOT create a new_comment at that location",
+                "- **MANDATORY**: Generate a reply_to entry for EVERY pending comment above \u2014 no exceptions, no omissions.",
+                "  For each comment_id in the pending list: check the current diff and either mark resolved=true (fixed) or resolved=false (still present).",
+                "- Pending issue NOW FIXED in the diff below \u2192 reply_to with resolved=true",
+                "- Pending issue STILL PRESENT and unchanged \u2192 reply_to with resolved=false; do NOT create a new_comment at that location",
                 "- Only genuinely NEW issues (not in the list above) go in new_comments",
                 "- NEVER duplicate a new_comment at a (path, line) that already has a pending comment",
                 "- NEVER approve while any pending issue remains unresolved",
@@ -496,11 +498,47 @@ runs:
         prev        = ctx.get('prev_comments', [])
         pending_ids = {c['id'] for c in prev if not c['is_resolved']}
         was_pending = len(pending_ids)
+
+        # Auto-resolve: pending threads not explicitly carried forward as still-pending.
+        # Claude is instructed to generate reply_to for every pending comment, but as a
+        # safety net we resolve any it silently omitted (avoids comment accumulation).
+        explicitly_still_pending = {
+            r['comment_id'] for r in data.get('reply_to', [])
+            if not r.get('resolved', True)
+        }
+        auto_resolved = 0
+        for comment in prev:
+            cid = comment['id']
+            if comment['is_resolved'] or cid in explicitly_still_pending:
+                continue
+            if cid in {r.get('comment_id') for r in data.get('reply_to', []) if r.get('resolved')}:
+                continue  # already handled in the reply_to loop above
+            tid = c2t.get(cid, {}).get('thread_id')
+            if not tid:
+                continue
+            r_reply = gh(
+                f'repos/{repo}/pulls/comments/{cid}/replies',
+                body={'body': '\u2705 Resolved \u2014 not present in the latest diff.'},
+                method='POST',
+            )
+            if r_reply.returncode == 0:
+                gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
+                       '{thread{id isResolved}}}')
+                subprocess.run(
+                    ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
+                    capture_output=True, text=True,
+                )
+                auto_resolved += 1
+                print(f'Auto-resolved thread for comment {cid}')
+        if auto_resolved:
+            print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
+
         # Only count as "newly done" comments that were actually pending before this review.
         # Avoids double-counting threads that were resolved externally (e.g. via GraphQL)
         # before the review ran — those are already in the already-resolved count.
         newly_done  = sum(1 for re in data.get('reply_to', [])
                           if re.get('resolved') and re.get('comment_id') in pending_ids)
+        newly_done += auto_resolved
         now_pending = max(0, was_pending - newly_done)
         now_resolved = sum(1 for c in prev if c['is_resolved']) + newly_done
         new_count   = len([c for c in data.get('new_comments', [])

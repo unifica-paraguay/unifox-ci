@@ -99,7 +99,8 @@ jobs:
 
           # Read the actual tag created (may differ from proposed if Claude re-analyzed)
           try:
-              tag = json.load(open('/tmp/release_parsed.json'))['new_tag']
+              with open('/tmp/release_parsed.json') as f:
+                  tag = json.load(f)['new_tag']
           except FileNotFoundError:
               tag = os.environ['PROPOSED_TAG']
 
