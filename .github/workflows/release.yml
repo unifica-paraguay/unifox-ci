@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (preview without creating tags or releases)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release unifox-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Uses local path — cannot use @v1 here because this workflow IS what
+      # creates v1 (the chicken-and-egg problem of self-versioning).
+      - uses: ./actions/release-tag
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          tag_prefix: semver
+          base_branch: main
+          dry_run: ${{ inputs.dry_run }}

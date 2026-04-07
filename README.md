@@ -22,7 +22,59 @@ The fox is the spirit of Unifica: quick, precise, and always watching your PRs.
 | **Odoo Tests Layer 1** | Runs test suite for modified modules only (fast, blocks merge) |
 | **Odoo Tests Layer 2** | Runs test suite for native Odoo dependencies of modified modules (regression, blocks merge) |
 | **Odoo Tests Layer 3** | Full nightly suite across all modules, no tag filter — opens a GitHub issue on failure |
-| **Release Prepare** | Generates AI changelog, creates git tag, publishes GitHub Release |
+| **Release Tag** | AI-driven system versioning: detects commits since last tag, asks Claude for the correct semver bump, creates annotated + floating + latest tags, and publishes a GitHub Release. Supports `semver` (v1.2.3) and `odoo` (19.0-v1.2.3) tag styles |
+
+---
+
+## Release Tag — system versioning
+
+unifox-ci distinguishes two versioning levels:
+
+| Level | Who owns it | Action |
+|-------|-------------|--------|
+| **Module** | Individual Odoo addons (`19.0.X.Y.Z` inside each `__manifest__.py`) | `pr-version-bump` — runs automatically on every PR |
+| **System** | The repository as a whole (what you tag when you cut a release) | `release-tag` — run manually via `workflow_dispatch` |
+
+### Tag styles
+
+**`semver`** — for generic repos (unifox-ci itself):
+```
+v1.0.0        ← immutable annotated tag
+v1            ← floating major tag (always latest v1.x.x)
+latest        ← always the very latest release
+```
+
+**`odoo`** — for Odoo addons repos with multiple active branches:
+```
+19.0-v1.2.3   ← immutable, branch-scoped
+19.0-v1       ← floating major for the 19.0 line
+19.0-latest   ← latest release on the 19.0 branch
+```
+
+Multiple Odoo branches coexist cleanly in the same repo:
+```
+18.0-v3.1.0   18.0-v3   18.0-latest
+19.0-v1.2.3   19.0-v1   19.0-latest
+20.0-v0.1.0   20.0-v1   20.0-latest   ← when Odoo 20 arrives
+```
+The branch prefix (`19.0-`) identifies the Odoo major release line and never changes. Only the `vX.Y.Z` segment bumps.
+
+### Self-versioning (unifox-ci)
+
+unifox-ci versions itself with its own `release-tag` action via a `workflow_dispatch` workflow (`.github/workflows/release.yml`). It uses `./actions/release-tag` (local path) instead of `@v1` to avoid the chicken-and-egg problem of needing a tag to create a tag.
+
+### Inputs
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `tag_prefix` | `semver` | `semver` for v1.2.3 style, `odoo` for 19.0-v1.2.3 style |
+| `odoo_version` | `19.0` | Odoo branch prefix. Only used when `tag_prefix=odoo` |
+| `base_branch` | `main` | Branch being released |
+| `dry_run` | `true` | **Always run dry first.** `true` = print only, nothing created |
+
+### dry_run is mandatory
+
+Always run with `dry_run=true` first to preview the tag Claude proposes and the changelog. No tags, no GitHub Release, no pushes happen in dry run mode. Only re-run with `dry_run=false` after verifying the output.
 
 ---
 
