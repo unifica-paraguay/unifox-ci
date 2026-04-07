@@ -442,7 +442,27 @@ runs:
         payload = {'commit_id': sha, 'body': rev_body, 'event': event, 'comments': inline}
         r = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')
         if r.returncode != 0:
+            # Inline comments were rejected (line numbers not in diff).
+            # Rebuild the body without the inline count so the summary is accurate.
+            fb_parts = []
+            if now_resolved:
+                fb_parts.append(f'{now_resolved} resolved')
+            if now_pending:
+                fb_parts.append(f'{now_pending} pending')
+            fb_status = ' \u00b7 '.join(fb_parts) if fb_parts else 'No issues found'
+            note = ''
+            if inline:
+                note = (f'\n\n_Note: {len(inline)} suggestion(s) could not be attached as inline '
+                        f'comments (line numbers not present in diff). See summary above._')
+            fallback_body = '\n'.join([
+                '<!-- unifox-review -->',
+                '',
+                data.get('summary', '') + note,
+                '',
+                f'**Issues:** {fb_status}',
+            ])
             payload['comments'] = []
+            payload['body'] = fallback_body
             r2 = gh(f'repos/{repo}/pulls/{pr}/reviews', body=payload, method='POST')
             if r2.returncode != 0:
                 print(f'Error creating review: {r2.stderr}')
