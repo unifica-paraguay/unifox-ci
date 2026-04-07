@@ -242,9 +242,14 @@ runs:
         LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
       run: |
         python3 - <<'PYEOF'
-        import json, os, subprocess
+        import json, os, subprocess, sys
 
-        data      = json.load(open('/tmp/release_parsed.json'))
+        try:
+            data = json.load(open('/tmp/release_parsed.json'))
+        except FileNotFoundError:
+            print("ERROR: /tmp/release_parsed.json not found — 'Ask Claude for version bump' step likely failed.")
+            sys.exit(1)
+
         repo      = os.environ['REPO']
         sha       = os.environ['SHA']
         run_url   = os.environ['RUN_URL']
@@ -328,15 +333,19 @@ runs:
         # Post comment on PR if one was found
         if pr_number:
             import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
-                import json as _json
-                _json.dump({'body': body}, tmp)
-                tmp_path = tmp.name
-            subprocess.run([
-                'gh', 'api', '--method', 'POST',
-                f'repos/{repo}/issues/{pr_number}/comments',
-                '--input', tmp_path,
-            ], env=env, check=True)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                    json.dump({'body': body}, tmp)
+                    tmp_path = tmp.name
+                subprocess.run([
+                    'gh', 'api', '--method', 'POST',
+                    f'repos/{repo}/issues/{pr_number}/comments',
+                    '--input', tmp_path,
+                ], env=env, check=True)
+            finally:
+                if tmp_path:
+                    os.unlink(tmp_path)
             print(f'Posted proposal comment on PR #{pr_number}')
         else:
             print('Skipping PR comment — no associated PR for this push')
