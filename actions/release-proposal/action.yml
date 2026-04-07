@@ -348,14 +348,19 @@ runs:
         # Post comment on PR if one was found
         if pr_number:
             import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tmp:
+            # delete=False so the path remains valid after close(); finally cleans up.
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+            try:
                 json.dump({'body': body}, tmp)
                 tmp.flush()
+                tmp.close()
                 r_comment = subprocess.run([
                     'gh', 'api', '--method', 'POST',
                     f'repos/{repo}/issues/{pr_number}/comments',
                     '--input', tmp.name,
                 ], env=env, capture_output=True, text=True)
+            finally:
+                os.unlink(tmp.name)
             if r_comment.returncode != 0:
                 print(f'Warning: could not post proposal comment on PR #{pr_number}: '
                       f'{r_comment.stderr.strip()}')

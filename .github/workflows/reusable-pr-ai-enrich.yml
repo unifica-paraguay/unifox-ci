@@ -66,6 +66,11 @@ jobs:
           echo "ERROR: unifox-ci GitHub App is not installed — install it to unblock CI."
           exit 1
 
+  # NOTE: composite actions below are always fetched at @v1 from the unifox-ci repo.
+  # GitHub Actions does not support expressions in `uses:`, so there is no way to
+  # pass a dynamic ref. Consequence: changes to actions/pr-enrich or actions/pr-review
+  # on a feature branch are NOT exercised by the local pipeline until the v1 tag is
+  # advanced to that commit. Advance v1 after every push to keep the tag in sync.
   enrich-metadata:
     name: Update title & description
     needs: pre-flight
