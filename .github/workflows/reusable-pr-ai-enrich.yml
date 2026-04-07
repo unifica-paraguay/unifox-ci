@@ -263,8 +263,8 @@ jobs:
 
   release-preview:
     name: Release preview
-    needs: pre-flight
-    if: ${{ inputs.enable_release_preview }}
+    needs: [pre-flight, enrich-metadata, static-checks, security-scan, auto-labels, ai-code-review]
+    if: always() && needs.pre-flight.result == 'success' && inputs.enable_release_preview
     runs-on: ubuntu-latest
     permissions:
       contents: read
