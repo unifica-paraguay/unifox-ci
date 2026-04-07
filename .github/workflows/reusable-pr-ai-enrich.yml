@@ -18,10 +18,6 @@ on:
         type: string
         default: "default"
 
-permissions:
-  contents: read
-  pull-requests: write
-
 jobs:
   # Verify the unifox-ci App token exactly once before running the parallel jobs.
   # This prevents both enrich-metadata and ai-code-review from each posting the
@@ -29,6 +25,9 @@ jobs:
   pre-flight:
     name: Verify App token
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # needed to post the "not installed" comment
     steps:
       - name: Generate app token
         id: gen-token
@@ -71,6 +70,8 @@ jobs:
     name: Update title & description
     needs: pre-flight
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # for checkout; all PR writes use the App token
     steps:
       - uses: actions/checkout@v4
         with:
@@ -88,6 +89,8 @@ jobs:
     name: AI code review
     needs: pre-flight
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # for checkout; all PR writes use the App token
     steps:
       - uses: actions/checkout@v4
         with:

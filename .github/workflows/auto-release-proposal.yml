@@ -81,6 +81,7 @@ jobs:
           dry_run: "false"
 
       - name: Update PR comment
+        shell: bash
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_NUMBER: ${{ needs.propose.outputs.pr_number }}
