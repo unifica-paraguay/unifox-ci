@@ -74,7 +74,9 @@ runs:
       env:
         BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
-        python "${{ github.action_path }}/../../scripts/check_commits.py" "$BASE_BRANCH"
+        python "${{ github.action_path }}/../../scripts/check_commits.py" "$BASE_BRANCH" \
+          2>&1 | tee /tmp/check_commits_output.txt
+        exit ${PIPESTATUS[0]}
 
     - name: "[2] Branch naming"
       id: branch
@@ -476,6 +478,25 @@ runs:
         passed  = [(l, o) for l, o in rows if o == 'success']
         skipped = [(l, o) for l, o in rows if o not in ('failure', 'success')]
 
+        # Map check label → output file written by each check step
+        import os as _os
+        check_output_files = {
+            'Commit messages': '/tmp/check_commits_output.txt',
+        }
+
+        def read_check_output(label):
+            path = check_output_files.get(label)
+            if not path:
+                return ''
+            try:
+                content = open(path).read().strip()
+                # Keep only error/warning lines — drop passing ✓ lines to reduce noise
+                relevant = [l for l in content.splitlines()
+                            if any(kw in l for kw in ('✗', 'FAIL', 'ERROR', 'WARNING', 'warning'))]
+                return '\n'.join(relevant) if relevant else content
+            except FileNotFoundError:
+                return ''
+
         # ── Header line ────────────────────────────────────────────────────────
         if failed:
             pill = f'\u274c {len(failed)} failed'
@@ -486,9 +507,14 @@ runs:
         # ── Body ───────────────────────────────────────────────────────────────
         lines = ['<!-- unifox-static-checks -->', header, '']
 
-        # Failures — one line each, prominent
+        # Failures — label + collapsible details with captured output
         for label, _ in failed:
-            lines.append(f'\u274c **{label}**')
+            details = read_check_output(label)
+            if details:
+                lines.append(f'\u274c **{label}**')
+                lines.append(f'<details><summary>Details</summary>\n\n```\n{details}\n```\n\n</details>')
+            else:
+                lines.append(f'\u274c **{label}**')
         if failed:
             lines.append('')
 
