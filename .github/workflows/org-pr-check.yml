@@ -1,0 +1,19 @@
+name: "Org PR Check"
+
+# Organisation-wide PR enrichment for unifica-paraguay.
+# This workflow is set as a Required Workflow in the org Repository Ruleset,
+# so it runs automatically on every PR in every repo — no per-repo setup needed.
+#
+# To customise behaviour for a specific repo, override inputs here or add a
+# per-repo pr-pipeline.yml that calls reusable-pr-ai-enrich.yml directly.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  ai-enrich:
+    uses: unifica-paraguay/unifox-ci/.github/workflows/reusable-pr-ai-enrich.yml@v1
+    with:
+      profile: auto
+    secrets: inherit
