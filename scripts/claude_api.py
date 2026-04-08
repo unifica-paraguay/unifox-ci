@@ -142,11 +142,35 @@ def call_claude(prompt: str, max_tokens: int = 8192) -> str:
             resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
+                stop_reason = data.get("stop_reason", "")
+                if stop_reason == "max_tokens":
+                    print(
+                        f"Warning: Claude hit max_tokens limit — response truncated "
+                        f"(attempt {attempt}/{MAX_RETRIES})",
+                        file=sys.stderr,
+                    )
                 for block in data.get("content", []):
                     if block.get("type") == "text":
-                        return block["text"]
-                print("ERROR: No text block in Claude response.", file=sys.stderr)
-                sys.exit(1)
+                        text = block["text"]
+                        if text.strip():
+                            return text
+                        # Empty text block — Claude returned nothing; retry
+                        print(
+                            f"Attempt {attempt}/{MAX_RETRIES}: empty text block "
+                            f"(stop_reason={stop_reason!r}) — retrying in {2**attempt}s",
+                            file=sys.stderr,
+                        )
+                        last_error = RuntimeError("Empty text block in API response")
+                        time.sleep(2 ** attempt)
+                        break
+                else:
+                    print(
+                        f"ERROR: No text block in Claude response "
+                        f"(stop_reason={stop_reason!r}, content={data.get('content', [])!r:.200})",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                continue
 
             if resp.status_code in (429, 500, 502, 503, 529):
                 wait = 2 ** attempt
