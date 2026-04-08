@@ -368,8 +368,8 @@ runs:
                         c for c in json.loads(comments_r.stdout or '[]')
                         if '<!-- unifox-release-proposal -->' in c.get('body', '')
                     ]
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    print(f'Warning: could not parse comments response: {e}')
 
             for old in old_comments:
                 node_id = old.get('node_id', '')

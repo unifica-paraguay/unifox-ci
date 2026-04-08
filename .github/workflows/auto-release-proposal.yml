@@ -127,11 +127,20 @@ jobs:
           ])
 
           if proposal:
-              subprocess.run([
-                  'gh', 'api', '--method', 'PATCH',
-                  f"repos/{repo}/issues/comments/{proposal['id']}",
-                  '-f', f'body={new_body}',
-              ], env=env, check=True)
+              import tempfile
+              from pathlib import Path
+              tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+              try:
+                  json.dump({'body': new_body}, tmp)
+                  tmp.flush()
+                  tmp.close()
+                  subprocess.run([
+                      'gh', 'api', '--method', 'PATCH',
+                      f"repos/{repo}/issues/comments/{proposal['id']}",
+                      '--input', tmp.name,
+                  ], env=env, check=True)
+              finally:
+                  Path(tmp.name).unlink(missing_ok=True)
               print(f'Updated proposal comment on PR #{pr_number} → {tag}')
           else:
               print(f'No proposal comment found on PR #{pr_number} — skipping')

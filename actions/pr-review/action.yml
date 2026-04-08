@@ -756,7 +756,12 @@ runs:
                 print(f"Warning: could not parse response ({e}) — safe fallback")
                 # _is_parse_error=True tells downstream code to skip auto-resolve so
                 # pending threads are NOT silently closed when Claude returned garbage.
-                data = {'verdict': 'COMMENT', 'summary': '\u26a0\ufe0f The AI review could not be completed for this push (API returned an empty or malformed response). It will retry automatically on the next push.', 'new_comments': [], 'reply_to': [], '_is_parse_error': True}
+                _msg = (
+                    '\u26a0\ufe0f The AI review could not be completed for this push '
+                    '(API returned an empty or malformed response). '
+                    'It will retry automatically on the next push.'
+                )
+                data = {'verdict': 'COMMENT', 'summary': _msg, 'new_comments': [], 'reply_to': [], '_is_parse_error': True}
 
         if 'veredicto' in data and 'verdict' not in data:
             data['verdict'] = data.pop('veredicto')
