@@ -44,6 +44,14 @@ on:
         description: "Run Odoo tests: Layer 1 (modified modules) + Layer 2 (native deps)"
         type: boolean
         default: false
+      enable_release_preview:
+        description: "Post a release proposal comment on the PR (minimize outdated ones)"
+        type: boolean
+        default: false
+      release_tag_prefix:
+        description: "Tag style for release preview: semver | odoo"
+        type: string
+        default: "semver"
 
 jobs:
   # -------------------------------------------------------------------------
@@ -89,7 +97,7 @@ jobs:
           exit 1
 
   # -------------------------------------------------------------------------
-  # NOTE: composite actions below are fetched at @claude/improve-bot-testing-q5hXf
+  # NOTE: composite actions below are fetched at @v1
   # so this feature branch tests its own code.
   # When merging to main: revert all @claude/... refs back to @v1 and advance
   # the v1 tag to the new main HEAD (git tag -f v1 HEAD && git push --force-tags).
@@ -105,7 +113,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/pr-enrich@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
@@ -126,7 +134,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-version-bump@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/pr-version-bump@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
@@ -146,7 +154,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer1@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer1@v1
         with:
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
@@ -165,7 +173,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer2@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/odoo-tests-layer2@v1
         with:
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
@@ -186,7 +194,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-review@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/pr-review@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
@@ -206,7 +214,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-security-scan@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/pr-security-scan@v1
         with:
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
@@ -226,7 +234,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-static-checks@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/pr-static-checks@v1
         with:
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
@@ -246,9 +254,30 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: unifica-paraguay/unifox-ci/actions/pr-labels@claude/improve-bot-testing-q5hXf
+      - uses: unifica-paraguay/unifox-ci/actions/pr-labels@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
           unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
           base_branch: ${{ github.base_ref }}
+
+  release-preview:
+    name: Release preview
+    needs: [pre-flight, enrich-metadata, static-checks, security-scan, auto-labels, ai-code-review]
+    if: always() && needs.pre-flight.result == 'success' && inputs.enable_release_preview
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: unifica-paraguay/unifox-ci/actions/release-proposal@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          unifox_app_id: ${{ secrets.UNIFOX_CI_APP_ID }}
+          unifox_private_key: ${{ secrets.UNIFOX_CI_PRIVATE_KEY }}
+          base_branch: ${{ github.base_ref }}
+          pr_number: ${{ github.event.pull_request.number }}
+          tag_prefix: ${{ inputs.release_tag_prefix }}

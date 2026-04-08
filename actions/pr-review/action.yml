@@ -756,7 +756,12 @@ runs:
                 print(f"Warning: could not parse response ({e}) — safe fallback")
                 # _is_parse_error=True tells downstream code to skip auto-resolve so
                 # pending threads are NOT silently closed when Claude returned garbage.
-                data = {'verdict': 'COMMENT', 'summary': 'Review parse error.', 'new_comments': [], 'reply_to': [], '_is_parse_error': True}
+                _msg = (
+                    '\u26a0\ufe0f The AI review could not be completed for this push '
+                    '(API returned an empty or malformed response). '
+                    'It will retry automatically on the next push.'
+                )
+                data = {'verdict': 'COMMENT', 'summary': _msg, 'new_comments': [], 'reply_to': [], '_is_parse_error': True}
 
         if 'veredicto' in data and 'verdict' not in data:
             data['verdict'] = data.pop('veredicto')
@@ -828,29 +833,65 @@ runs:
 
         errors = []
 
+        def resolve_thread(cid, c2t, label=''):
+            """Call resolveReviewThread for the thread containing comment cid.
+            Returns True on success, False on failure."""
+            if cid not in c2t:
+                print(f'  resolve: comment {cid} not in c2t mapping — skipping')
+                return False
+            tid = c2t[cid]['thread_id']
+            gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
+                   '{thread{id isResolved}}}')
+            r2 = subprocess.run(
+                ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
+                capture_output=True, text=True)
+            if r2.returncode != 0:
+                errors.append(f'resolve thread {tid}{label}: {r2.stderr[:200]}')
+                print(f'  resolve FAILED: {r2.stderr[:200]}')
+                return False
+            # gh api graphql exits 0 even if the response body contains errors;
+            # check explicitly to surface permission/token issues.
+            try:
+                resp = json.loads(r2.stdout)
+            except Exception:
+                resp = {}
+            gql_errors = resp.get('errors', [])
+            if gql_errors:
+                msg = gql_errors[0].get('message', '')[:200]
+                errors.append(f'resolve thread {tid}{label}: GraphQL error: {msg}')
+                print(f'  resolve GraphQL error: {msg}')
+                return False
+            is_resolved = (resp.get('data') or {}).get('resolveReviewThread', {}).get('thread', {}).get('isResolved')
+            print(f'  resolve OK: thread {tid} isResolved={is_resolved}{label}')
+            return True
+
         for reply in data.get('reply_to', []):
-            cid  = reply.get('comment_id')
-            body = reply.get('body', '').strip()
-            if not cid or not body:
+            cid      = reply.get('comment_id')
+            body     = reply.get('body', '').strip()
+            resolved = reply.get('resolved', False)
+            print(f'reply_to: comment_id={cid}, resolved={resolved}, body_len={len(body)}')
+            if not cid:
                 continue
+
+            # Use a default body so we can still resolve even if Claude omitted one.
+            if not body:
+                body = '\u2705 Fixed \u2014 closing thread.' if resolved else ''
+            if not body:
+                continue
+
             r = gh(f'repos/{repo}/pulls/comments/{cid}/replies',
                    body={'body': body}, method='POST')
             if r.returncode != 0:
+                print(f'  reply POST failed ({r.returncode}): {r.stderr[:200]}')
                 errors.append(f'reply {cid}: {r.stderr[:120]}')
+                # Still attempt resolve even if reply failed — the thread state matters more.
+                if resolved:
+                    resolve_thread(cid, c2t, label=f' (reply failed for {cid})')
                 continue
-            print(f'Replied to comment {cid}')
+            print(f'  reply posted to comment {cid}')
 
-            if reply.get('resolved') and cid in c2t:
-                tid = c2t[cid]['thread_id']
-                gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
-                       '{thread{id isResolved}}}')
-                r2 = subprocess.run(
-                    ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
-                    capture_output=True, text=True)
-                if r2.returncode != 0:
-                    errors.append(f'resolve thread {tid}: {r2.stderr[:120]}')
-                else:
-                    print(f'Resolved thread for comment {cid}')
+            if resolved:
+                resolve_thread(cid, c2t)
 
         for rid in ctx.get('bot_review_ids', []):
             r = gh(f'repos/{repo}/pulls/{pr}/reviews/{rid}/dismissals',
@@ -885,28 +926,15 @@ runs:
                     continue
                 if cid in already_replied_resolved:
                     continue  # already handled in the reply_to loop above
-                tid = c2t.get(cid, {}).get('thread_id')
-                if not tid:
-                    print(f'Warning: no thread_id mapping for comment {cid} — cannot auto-resolve')
-                    continue
                 # Resolve the thread first; only post the reply if resolution succeeds.
                 # This avoids a dangling reply comment when the GraphQL call fails.
-                gql = ('mutation($id:ID!){resolveReviewThread(input:{threadId:$id})'
-                       '{thread{id isResolved}}}')
-                gql_r = subprocess.run(
-                    ['gh', 'api', 'graphql', '-f', f'query={gql}', '-f', f'id={tid}'],
-                    capture_output=True, text=True,
-                )
-                if gql_r.returncode == 0:
+                if resolve_thread(cid, c2t, label=f' (auto-resolve for comment {cid})'):
                     auto_resolved += 1
-                    print(f'Auto-resolved thread for comment {cid}')
                     gh(
                         f'repos/{repo}/pulls/comments/{cid}/replies',
                         body={'body': '\u2705 Addressed \u2014 closing thread.'},
                         method='POST',
                     )
-                else:
-                    print(f'Warning: could not resolve thread {tid}: {gql_r.stderr.strip()}')
             if auto_resolved:
                 print(f'Auto-resolved {auto_resolved} thread(s) not carried forward by Claude')
 
@@ -915,10 +943,6 @@ runs:
         # before the review ran — those are already in the already-resolved count.
         newly_done_count  = sum(1 for re in data.get('reply_to', [])
                                 if re.get('resolved') and re.get('comment_id') in pending_ids)
-        newly_done_count += auto_resolved
-
-        newly_done_count = sum(1 for re in data.get('reply_to', [])
-                               if re.get('resolved') and re.get('comment_id') in pending_ids)
         newly_done_count += auto_resolved
 
         verdict = data.get('verdict', 'COMMENT')

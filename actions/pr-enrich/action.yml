@@ -231,7 +231,8 @@ runs:
             raw = raw.split('\n', 1)[1].rsplit('```', 1)[0].strip()
 
         try:
-            data = json.loads(raw)
+            # raw_decode tolerates trailing content after a valid JSON value
+            data, _ = json.JSONDecoder().raw_decode(raw)
         except json.JSONDecodeError as e:
             print(f"Warning: could not parse Claude response as JSON ({e}) — skipping update.")
             sys.exit(0)

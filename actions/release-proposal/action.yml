@@ -26,6 +26,10 @@ inputs:
     description: "Branch being released"
     required: false
     default: "main"
+  pr_number:
+    description: "PR number to comment on. When set, skips commit-to-PR detection."
+    required: false
+    default: ""
 
 outputs:
   proposed_tag:
@@ -243,6 +247,7 @@ runs:
         TAG_PREFIX: ${{ inputs.tag_prefix }}
         LAST_TAG: ${{ steps.last-tag.outputs.last_tag }}
         BASE_BRANCH: ${{ inputs.base_branch }}
+        INPUT_PR_NUMBER: ${{ inputs.pr_number }}
       run: |
         python3 - <<'PYEOF'
         import json, os, subprocess, sys
@@ -266,29 +271,29 @@ runs:
         bump_type = data['bump_type']
         reasoning = data['reasoning']
 
-        # Find PR associated with this commit
-        pr_r = subprocess.run(
-            ['gh', 'api', f'repos/{repo}/commits/{sha}/pulls',
-             '--header', 'Accept: application/vnd.github.v3+json'],
-            capture_output=True, text=True, env=env,
-        )
-        if pr_r.returncode != 0:
-            print(f"Warning: could not fetch associated PRs: {pr_r.stderr.strip()}")
-            prs = []
-        else:
-            try:
-                prs = json.loads(pr_r.stdout or '[]')
-            except json.JSONDecodeError as e:
-                print(f"Warning: could not parse PR list response: {e}")
+        # PR number: use input if provided, otherwise detect from commit
+        pr_number = os.environ.get('INPUT_PR_NUMBER', '').strip()
+        if not pr_number:
+            pr_r = subprocess.run(
+                ['gh', 'api', f'repos/{repo}/commits/{sha}/pulls',
+                 '--header', 'Accept: application/vnd.github.v3+json'],
+                capture_output=True, text=True, env=env,
+            )
+            if pr_r.returncode != 0:
+                print(f"Warning: could not fetch associated PRs: {pr_r.stderr.strip()}")
                 prs = []
-        # Filter to PRs targeting the release branch to avoid picking the wrong PR
-        # when a commit has been cherry-picked or backported to multiple PRs.
-        matching = [p for p in prs if p.get('base', {}).get('ref') == base_branch]
-        if not matching and prs:
-            print(f"Warning: none of the {len(prs)} associated PR(s) targets '{base_branch}' — "
-                  f"using first PR as fallback. PRs found: {[p['number'] for p in prs]}")
-            matching = prs[:1]
-        pr_number = str(matching[0]['number']) if matching else ''
+            else:
+                try:
+                    prs = json.loads(pr_r.stdout or '[]')
+                except json.JSONDecodeError as e:
+                    print(f"Warning: could not parse PR list response: {e}")
+                    prs = []
+            matching = [p for p in prs if p.get('base', {}).get('ref') == base_branch]
+            if not matching and prs:
+                print(f"Warning: none of the {len(prs)} associated PR(s) targets '{base_branch}' — "
+                      f"using first PR as fallback.")
+                matching = prs[:1]
+            pr_number = str(matching[0]['number']) if matching else ''
         print(f'Associated PR: #{pr_number}' if pr_number else 'No associated PR found')
 
         # Build changelog markdown
@@ -339,9 +344,10 @@ runs:
             '',
             '---',
             '',
-            f'\u23f3 **Pending approval** \u2014 A maintainer must approve the release'
-            f' in [GitHub Actions]({run_url}) to proceed.',
-            'The release will be created automatically upon approval.',
+            f'\U0001f501 **Merging this PR will automatically release `{new_tag}`.**',
+            'No further action needed \u2014 unifox-ci will tag and publish the release on merge.',
+            '',
+            f'_[View analysis run]({run_url})_',
         ]
         body = '\n'.join(body_parts)
 
@@ -349,7 +355,36 @@ runs:
         if pr_number:
             import tempfile
             from pathlib import Path
-            # delete=False so the path remains valid after close(); finally cleans up.
+
+            # Find and minimize any existing proposal comment (outdated)
+            comments_r = subprocess.run(
+                ['gh', 'api', f'repos/{repo}/issues/{pr_number}/comments', '--paginate'],
+                capture_output=True, text=True, env=env,
+            )
+            old_comments = []
+            if comments_r.returncode == 0:
+                try:
+                    old_comments = [
+                        c for c in json.loads(comments_r.stdout or '[]')
+                        if '<!-- unifox-release-proposal -->' in c.get('body', '')
+                    ]
+                except json.JSONDecodeError as e:
+                    print(f'Warning: could not parse comments response: {e}')
+
+            for old in old_comments:
+                node_id = old.get('node_id', '')
+                if node_id:
+                    minimize_r = subprocess.run([
+                        'gh', 'api', 'graphql',
+                        '-f', 'query=mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized}}}',
+                        '-f', f'id={node_id}',
+                    ], env=env, capture_output=True, text=True)
+                    if minimize_r.returncode == 0:
+                        print(f'Minimized outdated proposal comment {old["id"]}')
+                    else:
+                        print(f'Warning: could not minimize comment {old["id"]}: {minimize_r.stderr.strip()}')
+
+            # Post new proposal comment
             tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
             try:
                 json.dump({'body': body}, tmp)
