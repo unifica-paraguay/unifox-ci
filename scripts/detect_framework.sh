@@ -18,7 +18,7 @@ REPO_ROOT="${1:-.}"
 # 1. Explicit .unifox.yml profile field
 if [ -f "${REPO_ROOT}/.unifox.yml" ]; then
   profile=$(grep -E '^profile:' "${REPO_ROOT}/.unifox.yml" 2>/dev/null \
-    | head -1 | sed 's/profile:[[:space:]]*//' | tr -d '"'"'"' | xargs)
+    | head -1 | sed 's/profile:[[:space:]]*//' | tr -d "'\""  | xargs)
   if [ -n "$profile" ] && [ "$profile" != "auto" ]; then
     echo "$profile"
     exit 0
